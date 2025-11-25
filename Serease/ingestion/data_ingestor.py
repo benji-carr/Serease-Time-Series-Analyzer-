@@ -1,0 +1,281 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, List, Dict
+import pandas as pd
+
+
+@dataclass
+class IngestionMetadata:
+    """
+    Holds metadata about the ingestion result.
+
+    Instructions:
+    - Store simple summary stats (shape, column names, dtypes)
+    - Store ingestion settings (file_type, encoding, delimiter)
+    - Store warnings to help other modules understand ingestion issues
+    """
+    n_rows: int
+    n_cols: int
+    column_names: List[str]
+    dtypes: Dict[str, str]
+    file_type: str
+    encoding: Optional[str]
+    delimiter: Optional[str]
+    warnings: List[str]
+
+
+class DataIngestor:
+    """
+    Class responsible for reading user-uploaded CSV/Excel data
+    and producing a raw DataFrame with basic metadata.
+
+    Responsibilities:
+    - Detect file type if not provided
+    - Detect encoding (basic heuristic initially)
+    - Detect delimiter for CSV (use simple rules or csv.Sniffer)
+    - Load data into a DataFrame
+    - Run minimal validation checks and record warnings
+
+    NOT responsible for:
+    - Schema detection (date/target/exog) → handled by SchemaDetector
+    - Cleaning/resampling → handled by TimeSeriesCleaner
+    - Transformations or diagnostics → later modules
+    """
+
+    def __init__(
+            self,
+            source: str | Path | object,
+            file_type: Optional[str] = None,
+            encoding: Optional[str] = None,
+            delimiter: Optional[str] = None,
+            max_rows: Optional[int] = None,
+    ) -> None:
+        if isinstance(source, (str, Path)):
+            self.source = Path(source)
+        else:
+            self.source = source
+
+        self.file_type = file_type
+        self.encoding = encoding
+        self.delimiter = delimiter
+        self.max_rows = max_rows
+
+        self.df: Optional[pd.DataFrame] = None
+        self.warnings: list[str] = []
+
+    # ----------------------------------------------------------------------
+    # Public API
+    # ----------------------------------------------------------------------
+
+    def load(self) -> pd.DataFrame:
+        """
+        """
+        if self.file_type is None:
+            self.file_type = self._detect_file_type()
+
+        if self.file_type == 'csv':
+            df = self._load_csv()
+        elif self.file_type == 'excel':
+            df = self._load_excel()
+        else:
+            raise ValueError(f"Unsupported file type in load(): {self.file_type}")
+
+        self.df = df
+
+        self._basic_validate()
+
+        return df
+
+    def preview(self, n: int = 5) -> pd.DataFrame:
+        """
+        """
+        if self.df is None:
+            self.load()
+        return self.df.head(n)
+
+    def get_metadata(self) -> IngestionMetadata:
+        """
+        """
+        if self.df is None:
+            self.load()
+
+        dtypes = {col: str(dtype) for col, dtype in self.df.dtypes.items()}
+
+        return IngestionMetadata(
+            n_rows=len(self.df),
+            n_cols=self.df.shape[1],
+            column_names=list(self.df.columns),
+            dtypes=dtypes,
+            file_type=self.file_type or 'unknown',
+            encoding=self.encoding,
+            delimiter=getattr(self, 'delimiter', None),
+            warnings=self.warnings.copy(),
+        )
+
+    def validate(self) -> List[str]:
+        """
+        Run basic validation checks on the loaded DataFrame and return
+        a list of warnings.
+
+        This is a public wrapper around _basic_validate().
+        """
+        if self.df is None:
+            self.load()
+
+        self._basic_validate()
+        return self.warnings.copy()
+    # ----------------------------------------------------------------------
+    # Private helpers
+    # ----------------------------------------------------------------------
+
+    def _detect_file_type(self):
+        """
+        Use the file extenstion to determine whether the file is an excel or a csv. Raise an error if the file type is unsupported.
+        """
+        # checking file via filepath suffix or by filename if the filepath isn't available
+        if isinstance(self.source, (str, Path)):
+            suffix = Path(self.source).suffix.lower()
+        elif hasattr(self.source, "filename"):
+            suffix = Path(self.source.filename).suffix.lower()
+        else:
+            raise ValueError("Cannot detect file type from this source")
+        # once suffix is found we check it against
+        if suffix == ".csv":
+            return "csv"
+        elif suffix in {".xlsx", ".xls"}:
+            return "excel"
+        else:
+            raise ValueError(f"Unsupported file extension: {suffix}")
+
+    def _detect_encoding(self) -> str:
+        """
+        Investigate this later, I'm unsure off the top of my head how we would detect the encoding.
+        """
+        if isinstance(self.source, (str, Path)):
+            try:
+                import chardet
+                with open(self.source, 'rb') as f:
+                    raw = f.read(2048)  # sample of bits
+                detected = chardet.detect(raw)
+                return detected.get('encoding') or 'utf-8'
+            except Exception:
+                return 'utf-8'  # fallback to utf8
+        elif hasattr(self.source, "read"):  # file object, assume utf-8 as to not empty file stream
+            return 'utf-8'
+        return 'utf-8'
+
+    def _detect_delimiter(self):
+        """
+        Assume the delimiter is a comma, if not fallback on some other options/infer from the file contents.
+        """
+        if getattr(self, "delimiter", None) is not None:
+            return self.delimiter
+
+        default = ","
+
+        if not isinstance(self.source, (str, Path)):
+            return default
+
+        try:
+            import csv
+            with open(self.source, "r", newline="") as f:
+                sample = f.read(2048)
+            dialect = csv.Sniffer().sniff(sample)
+            return dialect.delimiter
+        except Exception:
+            return default
+
+    def _load_csv(self):
+        """
+        Use pandas read_csv or read_excel, set a minimum or maximum, then return the loaded dataframe.
+        """
+        encoding = self._detect_encoding()
+        delimiter = self._detect_delimiter()
+
+        if isinstance(self.source, (str, Path)):
+            df = pd.read_csv(
+                self.source,
+                encoding=encoding,
+                delimiter=delimiter,
+                nrows=self.max_rows,
+            )
+            return df
+
+        elif hasattr(self.source, "read"):
+            file_obj = self.source
+
+            if hasattr(file_obj, "seek"):
+                file_obj.seek(0)
+
+            df = pd.read_csv(
+                file_obj,
+                encoding=encoding,
+                delimiter=delimiter,
+                nrows=self.max_rows,
+            )
+            return df
+
+        else:
+            raise ValueError("Unsupported source type for CSV loading.")
+
+    def _load_excel(self):
+        """
+        Use pandas read_excel, set a minimum or maximum, then return the loaded dataframe
+        """
+
+        if isinstance(self.source, (str, Path)):
+            df = pd.read_excel(
+                self.source,
+                nrows=self.max_rows
+            )
+            return df
+        elif hasattr(self.source, 'read'):
+            file_obj = self.source
+
+            if hasattr(file_obj, 'seek'):
+                file_obj.seek(0)
+
+            df = pd.read_excel(
+                file_obj,
+                nrows=self.max_rows
+            )
+            return df
+
+        else:
+            raise ValueError("Unsupported source type for Excel loading.")
+
+    def _basic_validate(self) -> None:
+        """
+        Run minimal sanity checks on self.df and populate self.warnings.
+
+        - Raise if df is None or completely empty (catastrophic).
+        - Warn if very few rows (< 10).
+        - Warn if there are duplicate column names.
+        - Warn if there are no numeric or datetime-like columns at all.
+        """
+        if self.df is None:
+            raise RuntimeError("No DataFrame loaded. Call load() before _basic_validate().")
+
+        # Catastrophic: empty df
+        if self.df.empty:
+            raise ValueError("Loaded DataFrame is empty; cannot proceed with modeling.")
+
+        # Very few rows
+        if len(self.df) < 10:
+            self.warnings.append("Very few rows detected (< 10); models may be unreliable.")
+
+        # Duplicate column names
+        if self.df.columns.duplicated().any():
+            self.warnings.append("Duplicate column names detected in DataFrame.")
+
+        # Check whether there is at least one numeric or datetime-like column
+        has_numeric = any(pd.api.types.is_numeric_dtype(dtype) for dtype in self.df.dtypes)
+        has_datetime = any(pd.api.types.is_datetime64_any_dtype(dtype) for dtype in self.df.dtypes)
+
+        if not has_numeric and not has_datetime:
+            self.warnings.append(
+                "No numeric or datetime-like columns detected; "
+                "this may not be suitable for time series modeling."
+            )
