@@ -267,48 +267,77 @@ class TimeSeriesCleaner:
         return cleaned, True
 
     def _infer_frequency(
-        self,
-        index: pd.DatetimeIndex,
+            self,
+            index: pd.DatetimeIndex,
     ) -> Tuple[Optional[str], bool]:
         """
         Infer the frequency of a ``DateTimeIndex``.
 
-        Parameters
-        ----------
-        index : pandas.DatetimeIndex
-            Time index of the cleaned dataset.
-
-        Returns
-        -------
-        freq : str or None
-            Inferred frequency (e.g. ``'D'``, ``'MS'``), or ``None`` if no
-            reliable inference can be made.
-        is_regular : bool
-            True if the series appears regular at the inferred frequency,
-            False otherwise.
+        Strategy
+        --------
+        1. Use ``freq_override`` if provided.
+        2. Try ``pd.infer_freq``.
+        3. If that fails, fall back to the most common time delta between
+           consecutive timestamps. If this dominant delta explains the vast
+           majority of gaps (>= 95%), treat it as the effective frequency,
+           but mark the series as irregular.
         """
+        # 1. User override wins
         if self.freq_override is not None:
             return self.freq_override, True
 
+        # 2. Ask pandas first
         try:
             freq = pd.infer_freq(index)
         except ValueError:
             freq = None
 
-        if freq is None:
-            self.notes.append("Could not reliably infer a regular frequency for the series.")
+        if freq is not None:
+            # Basic regularity check: reindex and compare
+            full_index = pd.date_range(start=index[0], end=index[-1], freq=freq)
+            is_regular = len(full_index) == len(index) and index.equals(full_index)
+
+            if not is_regular:
+                self.notes.append(
+                    f"Series appears irregular relative to inferred frequency '{freq}'."
+                )
+            return freq, is_regular
+
+        # 3. Fallback: dominant time delta heuristic
+        if len(index) < 3:
+            self.notes.append("Too few points to infer a robust frequency.")
             return None, False
 
-        # Basic regularity check: reindex and compare
-        full_index = pd.date_range(start=index[0], end=index[-1], freq=freq)
-        is_regular = len(full_index) == len(index) and index.equals(full_index)
+        diffs = index.to_series().diff().dropna()
+        counts = diffs.value_counts()
+        dominant_delta = counts.index[0]
+        dominant_frac = counts.iloc[0] / counts.sum()
 
-        if not is_regular:
+        if dominant_frac < 0.95:
+            # No clearly dominant cadence
             self.notes.append(
-                f"Series appears irregular relative to inferred frequency '{freq}'."
+                "Could not reliably infer a regular frequency; "
+                "no dominant time delta between observations."
             )
+            return None, False
 
-        return freq, is_regular
+        # Try to convert Timedelta -> frequency string
+        try:
+            freq = pd.tseries.frequencies.to_offset(dominant_delta).freqstr
+        except Exception:
+            self.notes.append(
+                "Identified a dominant time delta "
+                f"({dominant_delta}) but could not map it to a frequency string."
+            )
+            return None, False
+
+        self.notes.append(
+            "Pandas could not infer a frequency, but a dominant cadence of "
+            f"{dominant_delta} (~{dominant_frac:.1%} of gaps) was detected "
+            f"and mapped to freq='{freq}'. Series may still be irregular."
+        )
+
+        return freq, False  # False = not perfectly regular
 
     def _handle_missing_dates(
         self,
