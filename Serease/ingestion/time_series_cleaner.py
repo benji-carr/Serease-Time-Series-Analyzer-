@@ -316,7 +316,7 @@ class TimeSeriesCleaner:
         freq: Optional[str],
     ) -> Tuple[pd.DataFrame, bool, int]:
         """
-        Detect missing timestamps and optionally reindex the series.
+        Detect missing timestamps and reindex the series to a complete grid.
 
         Parameters
         ----------
@@ -328,11 +328,14 @@ class TimeSeriesCleaner:
         Returns
         -------
         cleaned : pandas.DataFrame
-            Possibly reindexed DataFrame (depending on policy).
+            Reindexed DataFrame, with a complete date range from the first
+            to the last timestamp at the specified frequency. Any dates that
+            did not exist in the original data will appear with NaN values.
         has_missing : bool
-            Whether missing dates were detected.
+            Whether missing dates were detected in the original index.
         n_missing : int
-            Number of missing timestamps between start and end.
+            Number of missing timestamps between start and end in the
+            original series.
         """
         index = df_ts.index
 
@@ -340,7 +343,10 @@ class TimeSeriesCleaner:
             # Without a frequency, we cannot define "missing dates".
             return df_ts, False, 0
 
+        # Build the full expected index at the given frequency
         full_index = pd.date_range(start=index[0], end=index[-1], freq=freq)
+
+        # Compare original index to the full grid
         missing = full_index.difference(index)
         n_missing = len(missing)
         has_missing = n_missing > 0
@@ -348,11 +354,17 @@ class TimeSeriesCleaner:
         if has_missing:
             self.notes.append(
                 f"Detected {n_missing} missing timestamps between {index[0]} and {index[-1]} "
-                f"at frequency '{freq}'."
+                f"at frequency '{freq}'. The series has been reindexed to a full {freq} grid; "
+                "NaN values mark originally missing observations."
+            )
+        else:
+            self.notes.append(
+                f"No missing timestamps detected between {index[0]} and {index[-1]} "
+                f"at frequency '{freq}'. Index has been reindexed to a full grid."
             )
 
-            if self.missing_policy == "reindex":
-                df_ts = df_ts.reindex(full_index)
+        # Always reindex to the full grid; do not fill values here.
+        df_ts = df_ts.reindex(full_index)
 
         return df_ts, has_missing, n_missing
 
@@ -370,13 +382,13 @@ class TimeSeriesCleaner:
         Parameters
         ----------
         df_ts : pandas.DataFrame
-            Cleaned time series.
+            Cleaned time series (after reindexing to a full date grid).
         freq : str or None
             Inferred or user-provided frequency.
         has_missing : bool
-            Whether missing dates were detected.
+            Whether missing dates were present in the original series.
         n_missing : int
-            Number of missing timestamps.
+            Number of missing timestamps in the original series.
         has_duplicates : bool
             Whether duplicates were detected and resolved.
 
