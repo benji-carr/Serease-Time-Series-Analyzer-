@@ -9,12 +9,44 @@ import pandas as pd
 @dataclass
 class IngestionMetadata:
     """
-    Holds metadata about the ingestion result.
+    Metadata describing the result of a data ingestion operation.
 
-    Instructions:
-    - Store simple summary stats (shape, column names, dtypes)
-    - Store ingestion settings (file_type, encoding, delimiter)
-    - Store warnings to help other modules understand ingestion issues
+    This dataclass is produced by ``DataIngestor`` and captures basic
+    structural information about the loaded dataset along with ingestion-
+    related settings such as inferred file type, encoding, and delimiter.
+    Other components of the Serease pipeline use this metadata to perform
+    validation, schema detection, and diagnostics.
+
+    Parameters
+    ----------
+    n_rows : int
+        Number of rows in the loaded dataset.
+    n_cols : int
+        Number of columns in the dataset.
+    column_names : list of str
+        List of column names in the order they appear in the DataFrame.
+    dtypes : dict of {str: str}
+        Mapping of column names to their stringified pandas dtypes.
+    file_type : str
+        The detected or declared file type (e.g., ``'csv'`` or ``'excel'``).
+    encoding : str or None
+        Inferred file encoding, or ``None`` if not applicable.
+    delimiter : str or None
+        Inferred delimiter for CSV files (e.g., ``','`` or ``'\t'``);
+        ``None`` for non-CSV files.
+    warnings : list of str
+        List of human-readable ingestion warnings, such as:
+        - low row count
+        - duplicate column names
+        - absence of numeric or datetime columns
+        - encoding detection fallback
+
+    Notes
+    -----
+    This dataclass does not store the dataset itself—only structural
+    metadata useful for downstream schema detection and model preparation.
+    All fields are simple Python types to ensure JSON-serializability if
+    needed for logging or API responses.
     """
     n_rows: int
     n_cols: int
