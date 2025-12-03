@@ -92,7 +92,7 @@ class TimeSeriesCleaner:
         Schema information produced by ``SchemaDetector`` (date, target,
         exogenous columns, and basic diagnostics).
     freq : str, optional
-        User-specified frequency (e.g., ``'D'``, ``'MS'``). If provided,
+        User-specified frequency (e.g., ``'D'``, ``'H'``, ``'MS'``). If provided,
         this overrides automatic frequency inference.
     duplicates : {'sum', 'mean', 'first', 'last}, default 'sum'
         Strategy to resolve duplicate timestamps:
@@ -105,6 +105,11 @@ class TimeSeriesCleaner:
         frequency:
         - 'keep'    : do not reindex; only flag missing dates in metadata
         - 'reindex' : reindex to a complete date range and introduce NaNs
+    date_format : str, optional
+        Explicit strftime-compatible format string for parsing the date
+        column (e.g. ``'%Y-%m-%d %H:%M:%S'``). When provided, this format
+        is passed to ``pd.to_datetime`` to avoid slow per-element parsing
+        and to ensure consistent interpretation.
 
     Notes
     -----
@@ -120,12 +125,14 @@ class TimeSeriesCleaner:
         freq: Optional[str] = None,
         duplicates: DuplicatesPolicy = "sum",
         missing: MissingDatesPolicy = "keep",
+        date_format: Optional[str] = None,
     ) -> None:
         self.df = df.copy()
         self.schema = schema
         self.freq_override = freq
         self.duplicates_policy: DuplicatesPolicy = duplicates
         self.missing_policy: MissingDatesPolicy = missing
+        self.date_format = date_format  # new: used in _ensure_datetime_index
 
         self.notes: List[str] = []
 
@@ -180,7 +187,8 @@ class TimeSeriesCleaner:
     # ------------------------------------------------------------------
     def _ensure_datetime_index(self) -> pd.DataFrame:
         """
-        Convert the detected date column to a ``DateTimeIndex`` and sort.
+        Convert the detected date column to a ``DateTimeIndex`` using the
+        optional user-specified ``date_format`` if provided, then sort.
 
         Returns
         -------
@@ -199,24 +207,55 @@ class TimeSeriesCleaner:
         if date_col not in self.df.columns:
             raise ValueError(f"Date column '{date_col}' not found in DataFrame.")
 
-        # Parse to datetime
-        dt = pd.to_datetime(self.df[date_col], errors="coerce")
-
-        if dt.isna().all():
-            raise ValueError(f"Failed to parse any values in date column '{date_col}' as datetime.")
-
-        if dt.isna().any():
-            self.notes.append(
-                f"Date column '{date_col}' contains {dt.isna().sum()} unparseable values; "
-                "these rows will be dropped during cleaning."
+        # Parse to datetime (using explicit date_format if provided)
+        try:
+            dt = pd.to_datetime(
+                self.df[date_col],
+                errors="coerce",
+                format=self.date_format if self.date_format else None,
             )
+        except Exception as exc:
+            # Explicit format was provided but parsing failed hard
+            if self.date_format:
+                raise ValueError(
+                    f"Failed to parse date column '{date_col}' using "
+                    f"date_format='{self.date_format}'. Original error: {exc}"
+                )
+            else:
+                raise
 
-        # Drop rows with invalid dates
+        # Evaluate parsing success
+        if dt.isna().all():
+            if self.date_format:
+                raise ValueError(
+                    f"Failed to parse any values in date column '{date_col}' "
+                    f"using date_format='{self.date_format}'."
+                )
+            else:
+                raise ValueError(
+                    f"Failed to parse any values in date column '{date_col}' as datetime."
+                )
+
+        # Warn (via notes) about partial failures
+        if dt.isna().any():
+            n_bad = dt.isna().sum()
+            if self.date_format:
+                self.notes.append(
+                    f"Date column '{date_col}' has {n_bad} values that do not match "
+                    f"date_format='{self.date_format}'; dropping those rows."
+                )
+            else:
+                self.notes.append(
+                    f"Date column '{date_col}' contains {n_bad} unparseable values; "
+                    "these rows will be dropped during cleaning."
+                )
+
+        # Drop invalid rows and finalize
         mask_valid = ~dt.isna()
         df_ts = self.df.loc[mask_valid].copy()
         df_ts[date_col] = dt[mask_valid]
 
-        # Set index and sort
+        # Set index and sort chronologically
         df_ts = df_ts.set_index(date_col)
         df_ts = df_ts.sort_index()
 

@@ -35,6 +35,7 @@ class SchemaDetector:
         user_date_col: Optional[str] = None,
         user_target_col: Optional[str] = None,
         user_exog_cols: Optional[Sequence[str]] = None,
+        date_format: Optional[str] = None,
     ) -> None:
         self.df = df
         self.ingestion_meta = ingestion_meta
@@ -42,6 +43,7 @@ class SchemaDetector:
         self.user_date_col = user_date_col
         self.user_target_col = user_target_col
         self.user_exog_cols = list(user_exog_cols) if user_exog_cols else None
+        self.date_format = date_format
 
         # Will be filled by detect()
         self.date_col: Optional[str] = None
@@ -129,10 +131,12 @@ class SchemaDetector:
         """
         Infer the dataset's date column.
 
-        Detection priority:
+        Detection priority
+        ------------------
         1. Use ``user_date_col`` if provided and parseable.
         2. Prefer native pandas datetime64 columns.
-        3. Attempt to parse columns with date-like names.
+        3. Attempt to parse columns with date-like names (using explicit
+           ``date_format`` if provided).
         4. If all heuristics fail, return ``None`` and append a warning note.
 
         Returns
@@ -142,38 +146,54 @@ class SchemaDetector:
             can be found.
         """
         df = self.df
+        date_format = getattr(self, "date_format", None)
 
+        # --------------------------------------------------------------
         # 1. User override
+        # --------------------------------------------------------------
         if getattr(self, "user_date_col", None):
             col = self.user_date_col
             if col in df.columns:
                 try:
-                    _ = pd.to_datetime(df[col], errors="raise")
+                    _ = pd.to_datetime(
+                        df[col],
+                        errors="raise",
+                        format=date_format if date_format else None,
+                    )
                     return col
                 except Exception:
-                    self.notes.append(
-                        f"user_date_col='{col}' is not parseable as datetime; ignoring."
-                    )
+                    if date_format:
+                        self.notes.append(
+                            f"user_date_col='{col}' could not be parsed using "
+                            f"date_format='{date_format}'."
+                        )
+                    else:
+                        self.notes.append(
+                            f"user_date_col='{col}' is not parseable as datetime; ignoring."
+                        )
 
-        # 2. Existing datetime columns
+        # --------------------------------------------------------------
+        # 2. Native datetime64 columns (already parsed)
+        # --------------------------------------------------------------
         datetime_cols = df.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns.tolist()
+
         if len(datetime_cols) == 1:
             return datetime_cols[0]
+
         elif len(datetime_cols) > 1:
-            # Prefer names that look like dates
             preferred_tokens = ["date", "time", "timestamp", "period"]
             scored = []
             for col in datetime_cols:
                 name = col.lower()
                 score = sum(tok in name for tok in preferred_tokens)
                 scored.append((col, score))
-            scored.sort(key=lambda x: x[1], reverse=True)
-            if scored[0][1] > 0:
-                return scored[0][0]
-            # Otherwise, just take the first datetime column
-            return datetime_cols[0]
 
-        # 3. Try to parse any column with a date-like name
+            scored.sort(key=lambda x: x[1], reverse=True)
+            return scored[0][0]  # highest score (may be 0)
+
+        # --------------------------------------------------------------
+        # 3. Columns with date-like names — try parsing
+        # --------------------------------------------------------------
         candidate_cols = [
             c for c in df.columns
             if any(tok in c.lower() for tok in ["date", "time", "timestamp", "period"])
@@ -181,13 +201,23 @@ class SchemaDetector:
 
         for col in candidate_cols:
             try:
-                _ = pd.to_datetime(df[col], errors="raise")
+                _ = pd.to_datetime(
+                    df[col],
+                    errors="raise",
+                    format=date_format if date_format else None,
+                )
                 return col
             except Exception:
                 continue
 
-        # 4. Give up: no reliable date column
-        self.notes.append("No clear date/time column detected.")
+        # --------------------------------------------------------------
+        # 4. Give up
+        # --------------------------------------------------------------
+        self.notes.append(
+            "No clear date/time column detected. "
+            + (f"Tried parsing with date_format='{date_format}'." if date_format else "")
+        )
+
         return None
 
     def _detect_target_column(
