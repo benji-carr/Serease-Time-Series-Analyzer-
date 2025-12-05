@@ -134,9 +134,12 @@ class SchemaDetector:
         Detection priority
         ------------------
         1. Use ``user_date_col`` if provided and parseable.
-        2. Prefer native pandas datetime64 columns.
-        3. Attempt to parse columns with date-like names (using explicit
-           ``date_format`` if provided).
+        2. Prefer native pandas datetime64 columns (with name-based scoring
+           that favors plain 'date' over 'date_start' / 'date_end', etc.).
+        3. Among non-datetime columns, look at:
+           - column name (date/time/timestamp/period tokens)
+           - sample values (head(10+), parsed with pandas as datetimes)
+           and pick the best-scoring candidate.
         4. If all heuristics fail, return ``None`` and append a warning note.
 
         Returns
@@ -148,9 +151,66 @@ class SchemaDetector:
         df = self.df
         date_format = getattr(self, "date_format", None)
 
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Helper: name-based score for "date-ness"
+        #   - strong preference for exact 'date'
+        #   - then 'date_*' / '*_date'
+        #   - then generic 'date', 'time', 'timestamp', 'period' in name
+        #   - small penalty for 'start' / 'end' variants
+        # ------------------------------------------------------------------
+        preferred_tokens = ["date", "time", "timestamp", "period"]
+
+        def _name_score(col_name: str) -> int:
+            name = col_name.lower()
+            score = 0
+
+            # Exact 'date' gets a huge boost
+            if name == "date":
+                score += 1000
+
+            for tok in preferred_tokens:
+                if name == tok:
+                    score += 800
+                elif name.endswith("_" + tok) or name.startswith(tok + "_"):
+                    score += 400
+                elif tok in name:
+                    score += 150
+
+            # Slight penalty for 'start'/'end' to favor plain 'date'
+            if ("start" in name or "end" in name) and "date" in name and name != "date":
+                score -= 100
+
+            return score
+
+        # ------------------------------------------------------------------
+        # Helper: content-based score — how date-like are the values?
+        #   Use up to max_sample rows from head(), try to parse with
+        #   pd.to_datetime (with date_format if provided).
+        # ------------------------------------------------------------------
+        def _content_score(series: pd.Series, max_sample: int = 50) -> float:
+            s = series.head(max_sample).dropna()
+            if s.empty:
+                return 0.0
+
+            # Convert to string to be safe
+            s = s.astype(str)
+
+            try:
+                parsed = pd.to_datetime(
+                    s,
+                    errors="coerce",
+                    format=date_format if date_format else None,
+                )
+            except Exception:
+                return 0.0
+
+            # Fraction of sample that parses to a datetime
+            frac = (~parsed.isna()).mean()
+            return float(frac)
+
+        # ------------------------------------------------------------------
         # 1. User override
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
         if getattr(self, "user_date_col", None):
             col = self.user_date_col
             if col in df.columns:
@@ -172,51 +232,67 @@ class SchemaDetector:
                             f"user_date_col='{col}' is not parseable as datetime; ignoring."
                         )
 
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
         # 2. Native datetime64 columns (already parsed)
-        # --------------------------------------------------------------
+        #    If multiple, choose by name_score (favor 'date' over 'date_start').
+        # ------------------------------------------------------------------
         datetime_cols = df.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns.tolist()
 
         if len(datetime_cols) == 1:
             return datetime_cols[0]
 
         elif len(datetime_cols) > 1:
-            preferred_tokens = ["date", "time", "timestamp", "period"]
-            scored = []
-            for col in datetime_cols:
-                name = col.lower()
-                score = sum(tok in name for tok in preferred_tokens)
-                scored.append((col, score))
-
+            scored = [(col, _name_score(col)) for col in datetime_cols]
             scored.sort(key=lambda x: x[1], reverse=True)
-            return scored[0][0]  # highest score (may be 0)
+            # Even if all scores are 0, pick the first; they're all datetime anyway
+            return scored[0][0]
 
-        # --------------------------------------------------------------
-        # 3. Columns with date-like names — try parsing
-        # --------------------------------------------------------------
-        candidate_cols = [
-            c for c in df.columns
-            if any(tok in c.lower() for tok in ["date", "time", "timestamp", "period"])
-        ]
+        # ------------------------------------------------------------------
+        # 3. Non-datetime columns: use name + sample content
+        # ------------------------------------------------------------------
+        best_col: Optional[str] = None
+        best_score: float = -1.0
 
-        for col in candidate_cols:
-            try:
-                _ = pd.to_datetime(
-                    df[col],
-                    errors="raise",
-                    format=date_format if date_format else None,
-                )
-                return col
-            except Exception:
+        for col in df.columns:
+            # Skip columns that are already numeric datetime types (handled above)
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
                 continue
 
-        # --------------------------------------------------------------
+            # Compute name-based score
+            name_score = _name_score(col)
+
+            # Compute content-based score on a sample of at least 10 rows (if available)
+            content_frac = _content_score(df[col])
+            # content_frac is in [0, 1]; treat >0 as some evidence of date-like values
+
+            # If neither the name nor the content look remotely like dates, skip
+            if name_score == 0 and content_frac < 0.3:
+                continue
+
+            # Combine scores: weight name and content
+            # (adjust weights as needed; this strongly prefers 'date' but
+            #  still requires content to look reasonably date-like)
+            combined = name_score * 1.0 + content_frac * 500.0
+
+            if combined > best_score:
+                best_score = combined
+                best_col = col
+
+        if best_col is not None and best_score > 0:
+            # Optional: log what we did
+            self.notes.append(
+                f"Inferred date column '{best_col}' via name/content heuristics "
+                f"(combined_score={best_score:.1f})."
+            )
+            return best_col
+
+        # ------------------------------------------------------------------
         # 4. Give up
-        # --------------------------------------------------------------
-        self.notes.append(
-            "No clear date/time column detected. "
-            + (f"Tried parsing with date_format='{date_format}'." if date_format else "")
-        )
+        # ------------------------------------------------------------------
+        msg = "No clear date/time column detected."
+        if date_format:
+            msg += f" Tried parsing with date_format='{date_format}'."
+        self.notes.append(msg)
 
         return None
 
