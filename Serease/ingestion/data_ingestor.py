@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Dict
 import pandas as pd
+from pandas.errors import ParserError
+
 
 
 @dataclass
@@ -221,33 +223,90 @@ class DataIngestor:
 
     def _load_csv(self):
         """
-        Use pandas read_csv or read_excel, set a minimum or maximum, then return the loaded dataframe.
+        Load a CSV file into a DataFrame.
+
+        Strategy
+        --------
+        1. Detect encoding and delimiter.
+        2. First attempt: use pandas.read_csv with the detected delimiter
+           (fast C engine).
+        3. If a ParserError occurs (e.g., bad quoting or wrong delimiter),
+           log a warning and retry with pandas defaults:
+             - no explicit delimiter (let pandas infer sep)
+             - engine='python'
+             - on_bad_lines='warn' (or 'skip' if you prefer)
         """
         encoding = self._detect_encoding()
         delimiter = self._detect_delimiter()
 
-        if isinstance(self.source, (str, Path)):
-            df = pd.read_csv(
-                self.source,
-                encoding=encoding,
-                delimiter=delimiter,
-                nrows=self.max_rows,
-            )
-            return df
+        # --------------------------------------------------------------
+        # Helper: read from a path-like source
+        # --------------------------------------------------------------
+        def _read_from_path() -> pd.DataFrame:
+            # First attempt: our detected delimiter
+            try:
+                return pd.read_csv(
+                    self.source,
+                    encoding=encoding,
+                    delimiter=delimiter,
+                    nrows=self.max_rows,
+                )
+            except ParserError as exc:
+                # Fallback: behave more like a simple pd.read_csv(path)
+                self.warnings.append(
+                    "ParserError when reading CSV with detected delimiter "
+                    f"{repr(delimiter)}: {exc}. Retrying with pandas defaults "
+                    "(engine='python', sep inference, on_bad_lines='warn')."
+                )
+                return pd.read_csv(
+                    self.source,
+                    encoding=encoding,
+                    nrows=self.max_rows,
+                    engine="python",
+                    sep=None,  # let pandas infer the separator
+                    on_bad_lines="warn",
+                )
 
-        elif hasattr(self.source, "read"):
-            file_obj = self.source
-
+        # --------------------------------------------------------------
+        # Helper: read from a file-like object
+        # --------------------------------------------------------------
+        def _read_from_file_obj(file_obj) -> pd.DataFrame:
+            # Ensure we start at the beginning
             if hasattr(file_obj, "seek"):
                 file_obj.seek(0)
 
-            df = pd.read_csv(
-                file_obj,
-                encoding=encoding,
-                delimiter=delimiter,
-                nrows=self.max_rows,
-            )
-            return df
+            try:
+                return pd.read_csv(
+                    file_obj,
+                    encoding=encoding,
+                    delimiter=delimiter,
+                    nrows=self.max_rows,
+                )
+            except ParserError as exc:
+                self.warnings.append(
+                    "ParserError when reading CSV file-like object with detected "
+                    f"delimiter {repr(delimiter)}: {exc}. Retrying with pandas "
+                    "defaults (engine='python', sep inference, on_bad_lines='warn')."
+                )
+                if hasattr(file_obj, "seek"):
+                    file_obj.seek(0)
+                return pd.read_csv(
+                    file_obj,
+                    encoding=encoding,
+                    nrows=self.max_rows,
+                    engine="python",
+                    sep=None,
+                    on_bad_lines="warn",
+                )
+
+        # --------------------------------------------------------------
+        # Dispatch based on source type
+        # --------------------------------------------------------------
+        if isinstance(self.source, (str, Path)):
+            return _read_from_path()
+
+        elif hasattr(self.source, "read"):
+            return _read_from_file_obj(self.source)
 
         else:
             raise ValueError("Unsupported source type for CSV loading.")
