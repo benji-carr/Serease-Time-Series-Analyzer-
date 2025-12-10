@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional, List, Dict
 import pandas as pd
 from pandas.errors import ParserError
-
+import io
 
 
 @dataclass
@@ -183,22 +183,79 @@ class DataIngestor:
         else:
             raise ValueError(f"Unsupported file extension: {suffix}")
 
-    def _detect_encoding(self) -> str:
+    import io
+    from pathlib import Path
+    from typing import Optional
+
+    import chardet  # if you don't already import this
+    import pandas as pd
+
+    # inside class DataIngestor ...
+
+    def _detect_encoding(self) -> Optional[str]:
         """
-        Investigate this later, I'm unsure off the top of my head how we would detect the encoding.
+        Detect the file encoding for CSV sources.
+
+        Strategy
+        --------
+        - If user set `self.encoding`, honor it.
+        - For path-like sources, use chardet on a sample of bytes.
+        - Treat 'ascii' as 'utf-8' (ascii is a subset and most Kaggle files
+          are actually utf-8).
+        - If detection fails, default to 'utf-8'.
         """
+        if self.encoding is not None:
+            return self.encoding
+
+        # Only attempt detection for path-like sources; for file-like we let
+        # pandas decide (or user can pass encoding).
         if isinstance(self.source, (str, Path)):
+            path = Path(self.source)
+
             try:
-                import chardet
-                with open(self.source, 'rb') as f:
-                    raw = f.read(2048)  # sample of bits
-                detected = chardet.detect(raw)
-                return detected.get('encoding') or 'utf-8'
-            except Exception:
-                return 'utf-8'  # fallback to utf8
-        elif hasattr(self.source, "read"):  # file object, assume utf-8 as to not empty file stream
-            return 'utf-8'
-        return 'utf-8'
+                with open(path, "rb") as f:
+                    raw = f.read(2_000_000)  # up to ~2MB sample
+            except OSError:
+                # If reading fails, just fall back to utf-8
+                self.encoding = "utf-8"
+                self.warnings.append(
+                    f"Could not read bytes for encoding detection; defaulting to 'utf-8'."
+                )
+                return self.encoding
+
+            result = chardet.detect(raw)
+            enc = result.get("encoding")
+            conf = float(result.get("confidence") or 0.0)
+
+            if not enc:
+                # No clear guess → default
+                self.encoding = "utf-8"
+                self.warnings.append(
+                    f"Encoding detection inconclusive (confidence={conf:.2f}); "
+                    "defaulting to 'utf-8'."
+                )
+                return self.encoding
+
+            enc = enc.lower()
+
+            # IMPORTANT: chardet often returns 'ascii' for utf-8 files that
+            # happen to be mostly 7-bit; treat that as utf-8.
+            if enc in ("ascii", "us-ascii"):
+                self.encoding = "utf-8"
+                self.warnings.append(
+                    "Encoding detection returned 'ascii'; using 'utf-8' instead."
+                )
+                return self.encoding
+
+            # Otherwise accept chardet's guess
+            self.encoding = enc
+            self.warnings.append(
+                f"Detected encoding '{self.encoding}' (confidence={conf:.2f})."
+            )
+            return self.encoding
+
+        # Non-path-like sources → let pandas infer by default
+        return None
 
     def _detect_delimiter(self):
         """
@@ -221,6 +278,7 @@ class DataIngestor:
         except Exception:
             return default
 
+
     def _load_csv(self):
         """
         Load a CSV file into a DataFrame.
@@ -228,65 +286,104 @@ class DataIngestor:
         Strategy
         --------
         1. Detect encoding and delimiter.
-        2. First attempt: use pandas.read_csv with the detected delimiter
-           (fast C engine).
-        3. If a ParserError occurs (e.g., bad quoting or wrong delimiter),
-           log a warning and retry with pandas defaults:
-             - no explicit delimiter (let pandas infer sep)
-             - engine='python'
-             - on_bad_lines='warn' (or 'skip' if you prefer)
+        2. First attempt: pandas.read_csv with the detected encoding/delimiter.
+        3. If we hit a UnicodeDecodeError or ParserError, log a warning and
+           retry with safer defaults / alternate encodings.
         """
         encoding = self._detect_encoding()
         delimiter = self._detect_delimiter()
 
-        # --------------------------------------------------------------
-        # Helper: read from a path-like source
-        # --------------------------------------------------------------
-        def _read_from_path() -> pd.DataFrame:
-            # First attempt: our detected delimiter
+        # ----------------------------------------------------------
+        # Helper: attempt to read with given encoding + delimiter
+        # ----------------------------------------------------------
+        def _read_core(src, enc, delim):
+            return pd.read_csv(
+                src,
+                encoding=enc,
+                delimiter=delim,
+                nrows=self.max_rows,
+            )
+
+        # ----------------------------------------------------------
+        # Fallback logic for path-like sources
+        # ----------------------------------------------------------
+        def _read_from_path():
+            # First attempt: our detected encoding + delimiter
             try:
-                return pd.read_csv(
-                    self.source,
-                    encoding=encoding,
-                    delimiter=delimiter,
-                    nrows=self.max_rows,
+                return _read_core(self.source, encoding, delimiter)
+            except UnicodeDecodeError as exc:
+                self.warnings.append(
+                    f"UnicodeDecodeError with encoding={repr(encoding)}: {exc}. "
+                    "Retrying with fallback encodings."
                 )
             except ParserError as exc:
-                # Fallback: behave more like a simple pd.read_csv(path)
                 self.warnings.append(
-                    "ParserError when reading CSV with detected delimiter "
-                    f"{repr(delimiter)}: {exc}. Retrying with pandas defaults "
-                    "(engine='python', sep inference, on_bad_lines='warn')."
+                    f"ParserError with delimiter={repr(delimiter)}: {exc}. "
+                    "Retrying with pandas defaults (engine='python', sep inference)."
                 )
+                # For ParserError we immediately jump to python engine:
                 return pd.read_csv(
                     self.source,
                     encoding=encoding,
                     nrows=self.max_rows,
                     engine="python",
-                    sep=None,  # let pandas infer the separator
+                    sep=None,
                     on_bad_lines="warn",
                 )
 
-        # --------------------------------------------------------------
-        # Helper: read from a file-like object
-        # --------------------------------------------------------------
-        def _read_from_file_obj(file_obj) -> pd.DataFrame:
-            # Ensure we start at the beginning
+            # If we got here, it was a UnicodeDecodeError – try fallback encodings
+            fallback_encodings = ["utf-8", "latin-1"]
+            for enc in fallback_encodings:
+                if enc == encoding:
+                    continue
+                try:
+                    df = pd.read_csv(
+                        self.source,
+                        encoding=enc,
+                        delimiter=delimiter,
+                        nrows=self.max_rows,
+                    )
+                    self.warnings.append(
+                        f"Successfully re-read CSV using fallback encoding '{enc}'."
+                    )
+                    # Update self.encoding so metadata reports the actual one used
+                    self.encoding = enc
+                    return df
+                except UnicodeDecodeError:
+                    continue
+
+            # As a last resort, let pandas' python engine try to figure it out
+            self.warnings.append(
+                "All fallback encodings failed; using engine='python', "
+                "sep=None, on_bad_lines='warn'."
+            )
+            return pd.read_csv(
+                self.source,
+                encoding=encoding or "utf-8",
+                nrows=self.max_rows,
+                engine="python",
+                sep=None,
+                on_bad_lines="warn",
+            )
+
+        # ----------------------------------------------------------
+        # Fallback logic for file-like sources
+        # ----------------------------------------------------------
+        def _read_from_file_obj(file_obj):
             if hasattr(file_obj, "seek"):
                 file_obj.seek(0)
 
             try:
-                return pd.read_csv(
-                    file_obj,
-                    encoding=encoding,
-                    delimiter=delimiter,
-                    nrows=self.max_rows,
+                return _read_core(file_obj, encoding, delimiter)
+            except UnicodeDecodeError as exc:
+                self.warnings.append(
+                    f"UnicodeDecodeError with encoding={repr(encoding)} on file-like "
+                    f"source: {exc}. Retrying with fallback encodings."
                 )
             except ParserError as exc:
                 self.warnings.append(
-                    "ParserError when reading CSV file-like object with detected "
-                    f"delimiter {repr(delimiter)}: {exc}. Retrying with pandas "
-                    "defaults (engine='python', sep inference, on_bad_lines='warn')."
+                    f"ParserError with delimiter={repr(delimiter)} on file-like source: "
+                    f"{exc}. Retrying with pandas defaults (engine='python')."
                 )
                 if hasattr(file_obj, "seek"):
                     file_obj.seek(0)
@@ -299,9 +396,48 @@ class DataIngestor:
                     on_bad_lines="warn",
                 )
 
-        # --------------------------------------------------------------
+            # UnicodeDecodeError path: try fallbacks
+            fallback_encodings = ["utf-8", "latin-1"]
+            for enc in fallback_encodings:
+                if enc == encoding:
+                    continue
+                try:
+                    if hasattr(file_obj, "seek"):
+                        file_obj.seek(0)
+                    df = pd.read_csv(
+                        file_obj,
+                        encoding=enc,
+                        delimiter=delimiter,
+                        nrows=self.max_rows,
+                    )
+                    self.warnings.append(
+                        f"Successfully re-read CSV using fallback encoding '{enc}' "
+                        "for file-like source."
+                    )
+                    self.encoding = enc
+                    return df
+                except UnicodeDecodeError:
+                    continue
+
+            # Last resort for file-like
+            self.warnings.append(
+                "All fallback encodings failed on file-like source; using "
+                "engine='python', sep=None, on_bad_lines='warn'."
+            )
+            if hasattr(file_obj, "seek"):
+                file_obj.seek(0)
+            return pd.read_csv(
+                file_obj,
+                encoding=encoding or "utf-8",
+                nrows=self.max_rows,
+                engine="python",
+                sep=None,
+                on_bad_lines="warn",
+            )
+
+        # ----------------------------------------------------------
         # Dispatch based on source type
-        # --------------------------------------------------------------
+        # ----------------------------------------------------------
         if isinstance(self.source, (str, Path)):
             return _read_from_path()
 
