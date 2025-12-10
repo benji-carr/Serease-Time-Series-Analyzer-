@@ -214,9 +214,14 @@ class SchemaDetector:
         if getattr(self, "user_date_col", None):
             col = self.user_date_col
             if col in df.columns:
+                series = df[col]
+                if pd.api.types.is_numeric_dtype(series):
+                    series_for_parse = series.astype(str)
+                else:
+                    series_for_parse = series
                 try:
                     _ = pd.to_datetime(
-                        df[col],
+                        series_for_parse,
                         errors="raise",
                         format=date_format if date_format else None,
                     )

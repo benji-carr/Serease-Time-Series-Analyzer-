@@ -207,10 +207,16 @@ class TimeSeriesCleaner:
         if date_col not in self.df.columns:
             raise ValueError(f"Date column '{date_col}' not found in DataFrame.")
 
+        series = self.df[date_col]
+        if pd.api.types.is_numeric_dtype(series):
+            series_for_parse = series.astype(str)
+        else:
+            series_for_parse = series
+
         # Parse to datetime (using explicit date_format if provided)
         try:
             dt = pd.to_datetime(
-                self.df[date_col],
+                series_for_parse,
                 errors="coerce",
                 format=self.date_format if self.date_format else None,
             )
