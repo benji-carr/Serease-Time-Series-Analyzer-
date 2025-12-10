@@ -6,6 +6,7 @@ from typing import Optional, List, Dict
 import pandas as pd
 from pandas.errors import ParserError
 import io
+import chardet
 
 
 @dataclass
