@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -11,10 +11,9 @@ from statsmodels.tsa.seasonal import STL
 
 from .report_types import DiagnosticsReport, DiagnosticResult, DiagnosticArtifact
 from .utils import (
-    infer_seasonal_period_from_freq,
-    contiguous_nan_blocks,
     compute_fft_periodogram_candidates,
     choose_period_from_candidates,
+    infer_seasonal_period_from_freq,
 )
 
 
@@ -26,6 +25,16 @@ class VariantSelectionPolicy:
     max_lags: int = 60
     oversdiff_neg_acf1_threshold: float = -0.6
     prefer_transform_order: Tuple[str, ...] = ("log", "raw", "log1p")
+
+
+@dataclass
+class SeasonalityPolicy:
+    periodogram_top_k: int = 8
+    max_period_frac: float = 0.33
+    min_peak_ratio: float = 6.0
+    acf_gate: bool = True
+    acf_min_peak: float = 0.25
+    min_obs_for_periodogram: int = 40
 
 
 class DiagnosticsEngine:
@@ -69,12 +78,12 @@ class DiagnosticsEngine:
         enable_exog: bool = False,
         fourier_K: int = 5,
         ccf_max_lag: int = 30,
-        policy: Optional[VariantSelectionPolicy] = None,
-        prefer_period_detection: bool = True,
-        periodogram_top_k: int = 8,
+        variant_policy: Optional[VariantSelectionPolicy] = None,
+        seasonality_policy: Optional[SeasonalityPolicy] = None,
         stl_robust: bool = True,
     ) -> DiagnosticsReport:
-        pol = policy or VariantSelectionPolicy()
+        vpol = variant_policy or VariantSelectionPolicy()
+        spol = seasonality_policy or SeasonalityPolicy()
 
         report = DiagnosticsReport(
             target_col=self.target_col,
@@ -88,17 +97,16 @@ class DiagnosticsEngine:
         report.add(self._overview())
         report.add(self._missingness())
 
-        base_variant = self._choose_base_variant(pol)
+        base_variant = self._choose_base_variant(vpol)
         report.add(DiagnosticResult(step="base_variant", ok=True, summary={"base_variant": base_variant}))
 
-        period_res = None
-        if prefer_period_detection:
-            period_res = self._period_detection(base_variant=base_variant, top_k=periodogram_top_k)
-            report.add(period_res)
-
         m = seasonal_period
-        if m is None and period_res is not None and period_res.ok:
-            m = choose_period_from_candidates(period_res)
+        seasonality = self._detect_seasonality(base_variant=base_variant, policy=spol)
+        report.add(seasonality)
+
+        if m is None:
+            m = seasonality.summary.get("selected_m", None)
+
         if m is None:
             m = infer_seasonal_period_from_freq(self.freq)
 
@@ -107,28 +115,25 @@ class DiagnosticsEngine:
                 step="seasonal_period",
                 ok=True if m is not None else False,
                 summary={"seasonal_period": m},
-                warnings=[] if m is not None else ["No seasonal_period available."],
+                warnings=[] if m is not None else ["No seasonal period available."],
             )
         )
 
         self._ensure_seasonal_variants(m)
 
-        stationarity_res = self._stationarity_sweep(m=m, policy=pol)
+        stationarity_res = self._stationarity_sweep(m=m, policy=vpol)
         report.add(stationarity_res)
 
-        selection_res = self._select_stationary_variant(stationarity_res, policy=pol)
+        selection_res = self._select_stationary_variant(stationarity_res, policy=vpol)
         report.add(selection_res)
 
         selected = selection_res.summary.get("selected_stationary_variant")
         if selected is not None:
-            report.add(self._acf_pacf(variant=selected, policy=pol))
+            report.add(self._acf_pacf(variant=selected, policy=vpol))
         else:
             report.add(DiagnosticResult(step="acf_pacf", ok=False, warnings=["No stationary variant selected."]))
 
-        if m is not None:
-            report.add(self._stl(base_variant=base_variant, m=int(m), robust=stl_robust))
-        else:
-            report.add(DiagnosticResult(step="stl", ok=False, warnings=["No seasonal period available; skipping STL."]))
+        report.add(self._decomposition(base_variant=base_variant, m=m, robust=stl_robust))
 
         report.add(self._fourier_terms(m=m, K=fourier_K))
 
@@ -140,6 +145,92 @@ class DiagnosticsEngine:
             report.add(DiagnosticResult(step="exog", ok=True, notes=["Exogenous diagnostics disabled."]))
 
         return report
+
+    def _choose_base_variant(self, policy: VariantSelectionPolicy) -> str:
+        for name in policy.prefer_transform_order:
+            if self.bundle.has(name):
+                return name
+        return "raw"
+
+    def _detect_seasonality(self, base_variant: str, policy: SeasonalityPolicy) -> DiagnosticResult:
+        if not self.bundle.has(base_variant):
+            return DiagnosticResult(step="seasonality_assessment", ok=False, warnings=[f"Missing variant '{base_variant}'."])
+
+        s = self.bundle.get(base_variant).dropna()
+
+        if len(s) < int(policy.min_obs_for_periodogram):
+            return DiagnosticResult(
+                step="seasonality_assessment",
+                ok=True,
+                summary={
+                    "base_variant": base_variant,
+                    "status": "insufficient_data",
+                    "selected_m": None,
+                },
+                notes=["Too few observations for reliable period detection."],
+            )
+
+        candidates = compute_fft_periodogram_candidates(s, top_k=policy.periodogram_top_k)
+        cand_df = pd.DataFrame(candidates)
+
+        selected_m = choose_period_from_candidates(
+            cand_df,
+            n_obs=len(s),
+            max_period_frac=policy.max_period_frac,
+            min_peak_ratio=policy.min_peak_ratio,
+        )
+
+        notes: List[str] = []
+        status = "none"
+        acf_at_m = None
+
+        if selected_m is None:
+            notes.append("No strong seasonal period detected from periodogram guardrails.")
+        else:
+            if policy.acf_gate:
+                acf_vals = acf(s.values, nlags=min(int(selected_m), max(2, len(s) - 2)), fft=True)
+                if len(acf_vals) > int(selected_m):
+                    acf_at_m = float(acf_vals[int(selected_m)])
+                else:
+                    acf_at_m = None
+
+                if acf_at_m is None or abs(acf_at_m) < float(policy.acf_min_peak):
+                    notes.append(
+                        f"Periodogram suggested m={selected_m}, but ACF at lag m was weak "
+                        f"(acf_m={acf_at_m}); treating as no seasonality."
+                    )
+                    selected_m = None
+                else:
+                    status = "seasonal"
+                    notes.append(f"Selected m={selected_m} (periodogram + ACF gate).")
+            else:
+                status = "seasonal"
+                notes.append(f"Selected m={selected_m} (periodogram).")
+
+        res = DiagnosticResult(
+            step="seasonality_assessment",
+            ok=True,
+            summary={
+                "base_variant": base_variant,
+                "status": status,
+                "selected_m": selected_m,
+                "acf_at_m": acf_at_m,
+            },
+            notes=notes,
+        )
+        res.artifacts.append(DiagnosticArtifact(name="period_candidates", kind="table", payload=cand_df))
+        return res
+
+    def _ensure_seasonal_variants(self, m: Optional[int]) -> None:
+        if m is None:
+            return
+        if self.transformer is None:
+            return
+        try:
+            self.transformer.set_seasonal_period(int(m))
+            self.transformer.add_seasonal_variants(self.bundle)
+        except Exception:
+            return
 
     def _overview(self) -> DiagnosticResult:
         y = self._get_series_for_variant("raw")
@@ -163,58 +254,28 @@ class DiagnosticsEngine:
         y = self._get_series_for_variant("raw")
         mask = y.isna()
         n_missing = int(mask.sum())
-        blocks = contiguous_nan_blocks(mask)
+        longest = int(self._longest_true_run(mask.values))
 
-        res = DiagnosticResult(
+        return DiagnosticResult(
             step="missingness",
             ok=True,
             summary={
                 "n_missing": n_missing,
                 "missing_frac": float(n_missing / len(y)) if len(y) else 0.0,
-                "n_missing_blocks": int(len(blocks)),
-                "longest_missing_block": int(max((b[2] for b in blocks), default=0)),
+                "longest_missing_block": longest,
             },
         )
-        if blocks:
-            df_blocks = pd.DataFrame(blocks, columns=["start", "end", "length"]).sort_values("length", ascending=False)
-            res.artifacts.append(DiagnosticArtifact(name="missing_blocks", kind="table", payload=df_blocks))
-        return res
 
-    def _choose_base_variant(self, policy: VariantSelectionPolicy) -> str:
-        for name in policy.prefer_transform_order:
-            if self.bundle.has(name):
-                return name
-        return "raw"
-
-    def _period_detection(self, base_variant: str, top_k: int = 8) -> DiagnosticResult:
-        if not self.bundle.has(base_variant):
-            return DiagnosticResult(step="period_detection", ok=False, warnings=[f"Missing variant '{base_variant}'."])
-
-        s = self.bundle.get(base_variant).dropna()
-        if len(s) < 32:
-            return DiagnosticResult(step="period_detection", ok=False, warnings=["Too few observations for periodogram."])
-
-        candidates = compute_fft_periodogram_candidates(s, top_k=top_k)
-        df = pd.DataFrame(candidates)
-
-        res = DiagnosticResult(
-            step="period_detection",
-            ok=True,
-            summary={"base_variant": base_variant, "n_used": int(len(s))},
-        )
-        res.artifacts.append(DiagnosticArtifact(name="period_candidates", kind="table", payload=df))
-        return res
-
-    def _ensure_seasonal_variants(self, m: Optional[int]) -> None:
-        if m is None:
-            return
-        if self.transformer is None:
-            return
-        try:
-            self.transformer.set_seasonal_period(int(m))
-            self.transformer.add_seasonal_variants(self.bundle)
-        except Exception:
-            return
+    def _longest_true_run(self, arr: np.ndarray) -> int:
+        best = 0
+        cur = 0
+        for v in arr:
+            if bool(v):
+                cur += 1
+                best = max(best, cur)
+            else:
+                cur = 0
+        return best
 
     def _stationarity_sweep(self, m: Optional[int], policy: VariantSelectionPolicy) -> DiagnosticResult:
         candidates = self._candidate_variants(m=m)
@@ -239,7 +300,6 @@ class DiagnosticsEngine:
                 kpss_p = np.nan
 
             d, D, m_used, base = self._parse_variant_signature(v)
-
             a1 = self._acf_lag1(s)
 
             stationary_adf = (not np.isnan(adf_p)) and (adf_p < policy.adf_alpha)
@@ -323,7 +383,6 @@ class DiagnosticsEngine:
             summary={
                 "selected_stationary_variant": selected,
                 "pass_mode": pass_mode,
-                "selection_priority": "avoid over-differencing -> minimize total differencing -> minimize ADF p-value",
             },
         )
         res.artifacts.append(DiagnosticArtifact(name="selection_ranked", kind="table", payload=df_pass))
@@ -353,36 +412,68 @@ class DiagnosticsEngine:
         res.artifacts.append(DiagnosticArtifact(name="acf_pacf_values", kind="table", payload=df))
         return res
 
-    def _stl(self, base_variant: str, m: int, robust: bool = True) -> DiagnosticResult:
+    def _decomposition(self, base_variant: str, m: Optional[int], robust: bool = True) -> DiagnosticResult:
         if not self.bundle.has(base_variant):
             return DiagnosticResult(step="stl", ok=False, warnings=[f"Missing variant '{base_variant}'."])
 
         s = self.bundle.get(base_variant).dropna()
-        if len(s) < max(3 * int(m), 20):
-            return DiagnosticResult(step="stl", ok=False, warnings=["Too few observations for STL."])
+        if len(s) < 20:
+            return DiagnosticResult(step="stl", ok=False, warnings=["Too few observations for decomposition."])
 
-        fit = STL(s, period=int(m), robust=bool(robust)).fit()
+        if m is not None and int(m) >= 2 and len(s) >= max(3 * int(m), 20):
+            try:
+                fit = STL(s, period=int(m), robust=bool(robust)).fit()
+                df = pd.DataFrame({"observed": s, "trend": fit.trend, "seasonal": fit.seasonal, "resid": fit.resid})
 
-        df = pd.DataFrame({"observed": s, "trend": fit.trend, "seasonal": fit.seasonal, "resid": fit.resid})
+                seasonal_strength = 1.0 - (np.var(df["resid"]) / np.var(df["resid"] + df["seasonal"]))
+                trend_strength = 1.0 - (np.var(df["resid"]) / np.var(df["resid"] + df["trend"]))
 
-        seasonal_strength = 1.0 - (np.var(df["resid"]) / np.var(df["resid"] + df["seasonal"]))
-        trend_strength = 1.0 - (np.var(df["resid"]) / np.var(df["resid"] + df["trend"]))
+                res = DiagnosticResult(
+                    step="stl",
+                    ok=True,
+                    summary={
+                        "base_variant": base_variant,
+                        "method": "STL",
+                        "period": int(m),
+                        "seasonal_strength": float(seasonal_strength),
+                        "trend_strength": float(trend_strength),
+                    },
+                    notes=[],
+                )
+                res.artifacts.append(DiagnosticArtifact(name="stl_components", kind="table", payload=df))
+                return res
+            except Exception:
+                pass
+
+        window = int(max(5, min(len(s) // 10, 31)))
+        if window % 2 == 0:
+            window += 1
+
+        trend = s.rolling(window=window, center=True, min_periods=max(3, window // 3)).mean()
+        resid = s - trend
+        seasonal = pd.Series(0.0, index=s.index)
+
+        df = pd.DataFrame({"observed": s, "trend": trend, "seasonal": seasonal, "resid": resid})
 
         res = DiagnosticResult(
             step="stl",
             ok=True,
             summary={
                 "base_variant": base_variant,
-                "period": int(m),
-                "seasonal_strength": float(seasonal_strength),
-                "trend_strength": float(trend_strength),
+                "method": "trend_only",
+                "period": None,
+                "trend_window": int(window),
+                "seasonal_strength": 0.0,
             },
+            notes=[
+                "No usable seasonal period detected; produced a trend-only decomposition (trend + residual; seasonal=0)."
+            ],
         )
         res.artifacts.append(DiagnosticArtifact(name="stl_components", kind="table", payload=df))
         return res
 
     def _fourier_terms(self, m: Optional[int], K: int = 5) -> DiagnosticResult:
-        if m is None:
+        if m is None or int(m) < 2:
             return DiagnosticResult(step="fourier_terms", ok=False, warnings=["No seasonal period available."])
 
         n = len(self.cleaned_df.index)
@@ -427,9 +518,7 @@ class DiagnosticsEngine:
         else:
             base = "raw"
 
-        d = 0
-        if name == "diff1" or "_diff1" in name or name.startswith("diff1_"):
-            d = 1
+        d = 1 if (name == "diff1" or "_diff1" in name or name.startswith("diff1_")) else 0
 
         D = 0
         m = None
