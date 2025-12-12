@@ -432,3 +432,6 @@ class TimeSeriesTransformer:
     def _kpss_pvalue(self, s: pd.Series) -> float:
         res = kpss(s.values, regression="c", nlags="auto")
         return float(res[1])
+
+    def find(self, prefix: str) -> List[str]:
+        return [k for k in self.variants.keys() if k.startswith(prefix)]
