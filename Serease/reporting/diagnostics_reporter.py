@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from email.policy import default
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -22,7 +23,7 @@ from .plot_utils import (
 
 @dataclass
 class ReporterConfig:
-    theme: PlotTheme = PlotTheme()
+    theme: PlotTheme = field(default_factory=PlotTheme)
     dpi: int = 150
     max_table_rows: int = 40
 
