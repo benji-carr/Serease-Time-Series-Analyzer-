@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from email.policy import default
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-
 from IPython.display import HTML, display
 
 from .plot_utils import (
@@ -18,6 +16,7 @@ from .plot_utils import (
     periodogram_plot,
     acf_pacf_plot,
     stl_components_plot,
+    heatmap_table,
 )
 
 
@@ -26,6 +25,8 @@ class ReporterConfig:
     theme: PlotTheme = field(default_factory=PlotTheme)
     dpi: int = 150
     max_table_rows: int = 40
+    show_period_table: bool = False
+    show_acf_pacf_table: bool = False
 
 
 class DiagnosticsReporter:
@@ -56,21 +57,35 @@ class DiagnosticsReporter:
         return path
 
     def show_in_notebook(self) -> None:
-        html = self._build_html()
+        try:
+            html = self._build_html()
+        except Exception as e:
+            raise RuntimeError(
+                f"DiagnosticsReporter failed to build HTML: {type(e).__name__}: {e}"
+            ) from e
         display(HTML(html))
 
     def _build_html(self) -> str:
         sections: List[str] = []
         sections.append(self._html_header())
-        sections.append(self._section_overview())
-        sections.append(self._section_seasonality())
-        sections.append(self._section_variants_story())
-        sections.append(self._section_stationarity())
-        sections.append(self._section_acf_pacf())
-        sections.append(self._section_stl())
-        sections.append(self._section_recommendations())
+        sections.append(self._safe(self._section_overview, "Overview"))
+        sections.append(self._safe(self._section_seasonality, "Seasonality"))
+        sections.append(self._safe(self._section_variants_story, "Transformations and differencing"))
+        sections.append(self._safe(self._section_stationarity, "Stationarity"))
+        sections.append(self._safe(self._section_acf_pacf, "ACF and PACF"))
+        sections.append(self._safe(self._section_stl, "Decomposition"))
+        sections.append(self._safe(self._section_recommendations, "Notes and recommendations"))
         sections.append(self._html_footer())
         return "\n".join(sections)
+
+    def _safe(self, fn, name: str) -> str:
+        try:
+            return fn()
+        except Exception as e:
+            return (
+                f"<h2>{name}</h2>"
+                f"<div class='card'><div class='warn'>{type(e).__name__}: {e}</div></div>"
+            )
 
     def _html_header(self) -> str:
         return f"""
@@ -92,8 +107,17 @@ class DiagnosticsReporter:
   .kv {{ display: grid; grid-template-columns: 220px 1fr; gap: 6px 12px; }}
   .kv div {{ padding: 2px 0; }}
   img {{ max-width: 100%; height: auto; border-radius: 8px; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ border: 1px solid #e6e6e6; padding: 8px; text-align: left; font-size: 13px; }}
+  table {{ border-collapse: collapse; width: 100%; table-layout: auto; }}
+  th, td {{
+    border: 1px solid #e6e6e6;
+    padding: 8px;
+    text-align: left;
+    font-size: 13px;
+    vertical-align: top;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }}
   th {{ background: #fafafa; }}
   .small {{ font-size: 13px; color: #444; }}
   .pill {{ display: inline-block; padding: 2px 10px; border-radius: 999px; background: #f3f4f6; font-size: 12px; margin-right: 6px; }}
@@ -111,7 +135,7 @@ class DiagnosticsReporter:
 """
 
     def _meta_line(self) -> str:
-        bits = []
+        bits: List[str] = []
         if self.schema is not None:
             bits.append(f"<span class='pill'>target: {getattr(self.schema, 'target_col', None)}</span>")
             bits.append(f"<span class='pill'>date: {getattr(self.schema, 'date_col', None)}</span>")
@@ -196,7 +220,7 @@ class DiagnosticsReporter:
         fig_raw = lineplot_series(y, title="Target series (raw)", xlabel="time", ylabel="value")
         raw_b64 = fig_to_base64(fig_raw, dpi=self.config.dpi)
 
-        parts = []
+        parts: List[str] = []
         parts.append("<h2>Overview</h2>")
         parts.append("<div class='grid'>")
         parts.append(self._img_html(raw_b64, "Raw target series"))
@@ -225,19 +249,30 @@ class DiagnosticsReporter:
     def _section_seasonality(self) -> str:
         base = self._summary("base_variant").get("base_variant", None)
         m = self._summary("seasonal_period").get("seasonal_period", None)
-        cand = self._artifact_payload("period_detection", "period_candidates")
 
-        parts = []
+        sea = self._summary("seasonality_assessment")
+        status = sea.get("status", None)
+        selected_m = sea.get("selected_m", None)
+        acf_at_m = sea.get("acf_at_m", None)
+
+        cand = self._artifact_payload("seasonality_assessment", "period_candidates")
+
+        parts: List[str] = []
         parts.append("<h2>Seasonality</h2>")
         parts.append("<div class='grid'>")
 
-        info = []
+        info: List[str] = []
         info.append("<div class='card'>")
         info.append("<div class='kv'>")
         info.append(f"<div><b>base_variant</b></div><div>{base}</div>")
         info.append(f"<div><b>seasonal_period</b></div><div>{m}</div>")
+        info.append(f"<div><b>seasonality_status</b></div><div>{status}</div>")
+        info.append(f"<div><b>periodogram_selected_m</b></div><div>{selected_m}</div>")
+        info.append(f"<div><b>acf_at_m</b></div><div>{acf_at_m}</div>")
         for w in self._warnings("seasonal_period"):
             info.append(f"<div><b>warning</b></div><div class='warn'>{w}</div>")
+        for n in self._notes("seasonality_assessment"):
+            info.append(f"<div><b>note</b></div><div class='note'>{n}</div>")
         info.append("</div>")
         info.append("</div>")
         parts.append("\n".join(info))
@@ -246,10 +281,12 @@ class DiagnosticsReporter:
             fig = periodogram_plot(cand, title="Periodogram candidates (top peaks)")
             b64 = fig_to_base64(fig, dpi=self.config.dpi)
             parts.append(self._img_html(b64, "Periodogram candidate periods"))
-            parts.append("<div class='card'>")
-            parts.append("<div><b>Period candidates table</b></div>")
-            parts.append(self._table_html(cand))
-            parts.append("</div>")
+
+            if self.config.show_period_table:
+                parts.append("<div class='card'>")
+                parts.append("<div><b>Period candidates table</b></div>")
+                parts.append(self._table_html(cand))
+                parts.append("</div>")
         else:
             parts.append("<div class='card'><div class='small'>No period candidates available.</div></div>")
 
@@ -265,7 +302,7 @@ class DiagnosticsReporter:
         fig = multi_lineplot(series_map, title="Variant comparison (raw / transforms / differencing)")
         b64 = fig_to_base64(fig, dpi=self.config.dpi)
 
-        parts = []
+        parts: List[str] = []
         parts.append("<h2>Transformations and differencing</h2>")
         parts.append("<div class='grid'>")
         parts.append(self._img_html(b64, "Comparing key variants on the same time axis"))
@@ -289,7 +326,7 @@ class DiagnosticsReporter:
         sel_table = self._artifact_payload("variant_selection", "selection_ranked")
         sel_summary = self._summary("variant_selection")
 
-        parts = []
+        parts: List[str] = []
         parts.append("<h2>Stationarity</h2>")
         parts.append("<div class='grid'>")
 
@@ -312,6 +349,7 @@ class DiagnosticsReporter:
             if fig is not None:
                 b64 = fig_to_base64(fig, dpi=self.config.dpi)
                 parts.append(self._img_html(b64, "Heatmap over candidate variants"))
+
             parts.append("<div class='card'>")
             parts.append("<div><b>Stationarity sweep table</b></div>")
             parts.append(self._table_html(st))
@@ -332,7 +370,7 @@ class DiagnosticsReporter:
         ap = self._artifact_payload("acf_pacf", "acf_pacf_values")
         variant = self._summary("acf_pacf").get("variant", None)
 
-        parts = []
+        parts: List[str] = []
         parts.append("<h2>ACF and PACF</h2>")
         parts.append("<div class='grid'>")
 
@@ -340,10 +378,12 @@ class DiagnosticsReporter:
             fig = acf_pacf_plot(ap, title=f"ACF / PACF (variant: {variant})")
             b64 = fig_to_base64(fig, dpi=self.config.dpi)
             parts.append(self._img_html(b64, "ACF/PACF values"))
-            parts.append("<div class='card'>")
-            parts.append("<div><b>ACF/PACF table</b></div>")
-            parts.append(self._table_html(ap))
-            parts.append("</div>")
+
+            if self.config.show_acf_pacf_table:
+                parts.append("<div class='card'>")
+                parts.append("<div><b>ACF/PACF table</b></div>")
+                parts.append(self._table_html(ap))
+                parts.append("</div>")
         else:
             parts.append("<div class='card'><div class='small'>No ACF/PACF data available.</div></div>")
 
@@ -354,24 +394,29 @@ class DiagnosticsReporter:
         stl = self._artifact_payload("stl", "stl_components")
         stl_sum = self._summary("stl")
 
-        parts = []
-        parts.append("<h2>STL decomposition</h2>")
+        parts: List[str] = []
+        parts.append("<h2>Decomposition</h2>")
         parts.append("<div class='grid'>")
 
         if isinstance(stl, pd.DataFrame) and not stl.empty:
-            fig = stl_components_plot(stl, title="STL components")
+            method = stl_sum.get("method", None)
+            title = "Decomposition components" if method != "STL" else "STL components"
+
+            fig = stl_components_plot(stl, title=title)
             b64 = fig_to_base64(fig, dpi=self.config.dpi)
             parts.append(self._img_html(b64, "Observed, trend, seasonal, residual"))
 
             parts.append("<div class='card'>")
-            parts.append("<div><b>STL summary</b></div>")
+            parts.append("<div><b>Decomposition summary</b></div>")
             parts.append("<div class='kv'>")
             for k, v in stl_sum.items():
                 parts.append(f"<div><b>{k}</b></div><div>{v}</div>")
+            for n in self._notes("stl"):
+                parts.append(f"<div><b>note</b></div><div class='note'>{n}</div>")
             parts.append("</div>")
             parts.append("</div>")
         else:
-            parts.append("<div class='card'><div class='small'>No STL components available.</div></div>")
+            parts.append("<div class='card'><div class='small'>No decomposition components available.</div></div>")
 
         parts.append("</div>")
         return "\n".join(parts)
@@ -379,7 +424,7 @@ class DiagnosticsReporter:
     def _section_recommendations(self) -> str:
         recs = self._auto_recommendations()
 
-        parts = []
+        parts: List[str] = []
         parts.append("<h2>Notes and recommendations</h2>")
         parts.append("<div class='card'>")
         if not recs:
@@ -395,14 +440,12 @@ class DiagnosticsReporter:
     def _bundle_series_safe(self, name: str) -> pd.Series:
         if self.bundle is not None and hasattr(self.bundle, "has") and self.bundle.has(name):
             return self.bundle.get(name)
-        if name == "raw" and self.cleaned_df is not None and self.schema is not None:
-            tc = getattr(self.schema, "target_col", None)
-            if tc is not None and tc in self.cleaned_df.columns:
-                return self.cleaned_df[tc]
+
         if self.cleaned_df is not None and self.schema is not None:
             tc = getattr(self.schema, "target_col", None)
             if tc is not None and tc in self.cleaned_df.columns:
                 return self.cleaned_df[tc]
+
         raise KeyError(f"Cannot find series '{name}' in bundle or cleaned_df.")
 
     def _choose_story_variants(self, selected: Optional[str]) -> List[str]:
@@ -418,16 +461,22 @@ class DiagnosticsReporter:
     def _auto_recommendations(self) -> List[str]:
         recs: List[str] = []
 
-        m = self._summary("seasonal_period").get("seasonal_period", None)
-        if m is None:
-            recs.append("No seasonal period was selected; STL was skipped and seasonal structure may be under-modeled.")
+        stl_sum = self._summary("stl")
+        method = stl_sum.get("method", None)
+        period = stl_sum.get("period", None)
+
+        if method == "trend_only":
+            recs.append("Seasonality was weak or unavailable; used a trend-only decomposition (seasonal=0).")
+        elif method == "STL":
+            recs.append(f"STL decomposition used with seasonal period m={period}.")
         else:
-            recs.append(f"Seasonal period selected: m={m}. Use this as the seasonal period for STL and seasonal ARIMA terms.")
+            recs.append("Decomposition results were unavailable.")
 
         sel = self._summary("variant_selection")
         selected = sel.get("selected_stationary_variant", None)
         if selected is None:
-            recs.append("No stationary variant was selected. Consider providing a seasonal period or increasing observation count.")
+            recs.append("No stationary variant was selected. Consider increasing observation count or revisiting transformations.")
+            recs.extend(self._warnings("stationarity_sweep"))
             return recs
 
         recs.append(f"Selected stationary variant: {selected}.")
@@ -446,8 +495,10 @@ class DiagnosticsReporter:
 
         recs.extend(self._notes("overview"))
         recs.extend(self._notes("missingness"))
+        recs.extend(self._notes("seasonality_assessment"))
         recs.extend(self._notes("seasonal_period"))
         recs.extend(self._notes("variant_selection"))
+        recs.extend(self._notes("stl"))
 
         for w in self._warnings("stationarity_sweep"):
             recs.append(f"Stationarity sweep warning: {w}")
