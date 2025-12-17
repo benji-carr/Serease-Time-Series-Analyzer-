@@ -1,9 +1,10 @@
-from .diagnostics_engine import DiagnosticsEngine
-from .report_types import DiagnosticsReport, DiagnosticResult, DiagnosticArtifact
+from .diagnostics_engine import DiagnosticsEngine, DiagnosticsConfig
+from .report_types import DiagnosticsReport, StepResult, Artifact
 
 __all__ = [
     "DiagnosticsEngine",
+    "DiagnosticsConfig",
     "DiagnosticsReport",
-    "DiagnosticResult",
-    "DiagnosticArtifact",
+    "StepResult",
+    "Artifact",
 ]
