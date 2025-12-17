@@ -414,36 +414,22 @@ class TimeSeriesCleaner:
         return freq, False  # False = not perfectly regular
 
     def _handle_missing_dates(
-        self,
-        df_ts: pd.DataFrame,
-        freq: Optional[str],
+            self,
+            df_ts: pd.DataFrame,
+            freq: Optional[str],
     ) -> Tuple[pd.DataFrame, bool, int]:
         """
-        Detect missing timestamps and reindex the series to a complete grid.
+        Detect missing timestamps relative to `freq`.
 
-        Parameters
-        ----------
-        df_ts : pandas.DataFrame
-            Time-indexed DataFrame after duplicate handling.
-        freq : str or None
-            Inferred or user-provided frequency.
-
-        Returns
-        -------
-        cleaned : pandas.DataFrame
-            Reindexed DataFrame, with a complete date range from the first
-            to the last timestamp at the specified frequency. Any dates that
-            did not exist in the original data will appear with NaN values.
-        has_missing : bool
-            Whether missing dates were detected in the original index.
-        n_missing : int
-            Number of missing timestamps between start and end in the
-            original series.
+        Behavior
+        --------
+        - If freq is None (or empty index), we cannot define "missing dates" -> return (df_ts, False, 0).
+        - If missing_policy == "keep": DO NOT reindex; only compute and report missingness.
+        - If missing_policy == "reindex": reindex to a complete grid (introducing NaNs).
         """
         index = df_ts.index
 
         if freq is None or len(index) == 0:
-            # Without a frequency, we cannot define "missing dates".
             return df_ts, False, 0
 
         # Build the full expected index at the given frequency
@@ -451,24 +437,37 @@ class TimeSeriesCleaner:
 
         # Compare original index to the full grid
         missing = full_index.difference(index)
-        n_missing = len(missing)
+        n_missing = int(len(missing))
         has_missing = n_missing > 0
 
+        # Notes (informational either way)
         if has_missing:
             self.notes.append(
                 f"Detected {n_missing} missing timestamps between {index[0]} and {index[-1]} "
-                f"at frequency '{freq}'. The series has been reindexed to a full {freq} grid; "
-                "NaN values mark originally missing observations."
+                f"at frequency '{freq}'."
             )
         else:
             self.notes.append(
                 f"No missing timestamps detected between {index[0]} and {index[-1]} "
-                f"at frequency '{freq}'. Index has been reindexed to a full grid."
+                f"at frequency '{freq}'."
             )
 
-        # Always reindex to the full grid; do not fill values here.
-        df_ts = df_ts.reindex(full_index)
+        # Policy gate
+        if self.missing_policy == "keep":
+            if has_missing:
+                self.notes.append("missing_policy='keep': leaving index irregular; not reindexing.")
+            return df_ts, has_missing, n_missing
 
+        # missing_policy == "reindex" (default behavior)
+        if has_missing:
+            self.notes.append(
+                f"missing_policy='reindex': reindexing to a full {freq} grid; "
+                "NaN values mark originally missing observations."
+            )
+        else:
+            self.notes.append(f"missing_policy='reindex': index already complete; reindexing is a no-op.")
+
+        df_ts = df_ts.reindex(full_index)
         return df_ts, has_missing, n_missing
 
     def _build_meta(
