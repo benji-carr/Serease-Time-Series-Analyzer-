@@ -59,7 +59,7 @@ class IngestionMetadata:
     encoding: Optional[str]
     delimiter: Optional[str]
     warnings: List[str]
-    index_is_datetime: bool
+    index_is_datetime: bool = False
 
 
 class DataIngestor:
@@ -136,6 +136,9 @@ class DataIngestor:
         """
         if self.df is None:
             self.load()
+
+        idx = self.df.index
+        index_is_datetime = isinstance(idx, pd.DatetimeIndex) or pd.api.types.is_datetime64_any_dtype(idx)
 
         dtypes = {col: str(dtype) for col, dtype in self.df.dtypes.items()}
 
