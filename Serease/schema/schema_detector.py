@@ -152,6 +152,17 @@ class SchemaDetector:
         date_format = getattr(self, "date_format", None)
 
         # ------------------------------------------------------------------
+        # 0. If the dataframe index is already datetime-like, allow using it
+        # ------------------------------------------------------------------
+        index_is_datetime = isinstance(df.index, pd.DatetimeIndex) or pd.api.types.is_datetime64_any_dtype(df.index)
+
+        # If user did NOT explicitly provide a date column, prefer the index.
+        # This avoids "date_col=None" when the dataset is already properly indexed.
+        if index_is_datetime and not getattr(self, "user_date_col", None):
+            self.notes.append("Using DateTimeIndex as date column (date_col='__index__').")
+            return "__index__"
+
+        # ------------------------------------------------------------------
         # Helper: name-based score for "date-ness"
         #   - strong preference for exact 'date'
         #   - then 'date_*' / '*_date'
