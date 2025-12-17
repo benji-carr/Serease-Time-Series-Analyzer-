@@ -152,23 +152,161 @@ class TimeSeriesTransformer:
     # ---------------------------------------------------------------------
     def fit(self, cleaned_df: pd.DataFrame) -> TransformBundle:
         """
-        Build a TransformBundle using a sequential stationarity-first process.
+        Build a TransformBundle using a sequential, evidence-gated process.
 
-        A) raw -> check
-        B) variance stabilization (log/log1p) -> check after each
-        C) seasonal differencing (if m set) -> check after each
-        D) non-seasonal differencing -> check after each
+        Order (only applied when justified):
+          A) raw -> stationarity check
+          B) variance stabilization (log/log1p) [only if heteroskedasticity evidence]
+          C) seasonal differencing (if m set)   [only if seasonality evidence for m]
+          D) non-seasonal differencing          [only if persistence/unit-root evidence]
 
-        If tests are disabled/unavailable, we still create the variants but cannot stop early.
+        Notes:
+          - We always *register* created variants (for reporting/provenance),
+            but we only *carry forward* a transform if it is justified and/or improves diagnostics.
+          - Stationarity is evaluated via _stationarity_checkpoint (ADF+KPSS heuristic).
         """
         self._validate_input(cleaned_df)
-
-        # NOTE: Keep this strict for now; coercion policy belongs upstream (cleaner).
         y_raw = cleaned_df[self.target_col].astype("float64")
 
         bundle = TransformBundle(base_name="raw")
 
-        # --- register raw ---
+        # ----------------------------
+        # Local helpers (MVP-safe)
+        # ----------------------------
+        def _finite_series(s: pd.Series) -> pd.Series:
+            return s.astype("float64").replace([np.inf, -np.inf], np.nan).dropna()
+
+        def _rolling_mean_std_corr(s: pd.Series, window: int) -> Optional[float]:
+            """Proxy for multiplicative variance: corr(rolling mean, rolling std)."""
+            x = _finite_series(s)
+            if len(x) < max(window * 2, 20):
+                return None
+            rm = x.rolling(window).mean()
+            rs = x.rolling(window).std()
+            df = pd.concat([rm, rs], axis=1).dropna()
+            if len(df) < max(10, window):
+                return None
+            c = np.corrcoef(df.iloc[:, 0].values, df.iloc[:, 1].values)[0, 1]
+            if np.isnan(c):
+                return None
+            return float(c)
+
+        def _needs_variance_stabilization(s: pd.Series) -> bool:
+            """
+            Gate for variance stabilization.
+            Methodology: if variance grows with level, log-type transforms are justified.
+            """
+            x = _finite_series(s)
+            if len(x) < 30:
+                return False
+            w = max(10, min(30, len(x) // 5))
+            c = _rolling_mean_std_corr(x, w)
+            # conservative threshold: require a *meaningful* positive relationship
+            return (c is not None) and (c >= 0.35)
+
+        def _variance_improved(before: pd.Series, after: pd.Series) -> bool:
+            """Accept variance transform only if it reduces mean-std coupling materially."""
+            x0 = _finite_series(before)
+            x1 = _finite_series(after)
+            if len(x0) < 30 or len(x1) < 30:
+                return False
+            w0 = max(10, min(30, len(x0) // 5))
+            w1 = max(10, min(30, len(x1) // 5))
+            c0 = _rolling_mean_std_corr(x0, w0)
+            c1 = _rolling_mean_std_corr(x1, w1)
+            if c0 is None or c1 is None:
+                return False
+            # require a real improvement, not noise
+            return (c1 <= c0 - 0.10)
+
+        def _seasonality_supported(s: pd.Series, m: int) -> bool:
+            """
+            Gate for seasonal differencing at period m.
+            Methodology: only seasonal-diff if there is evidence of seasonal dependence at lag m.
+
+            MVP evidence proxy: correlation between s[t] and s[t-m] after demeaning.
+            """
+            x = _finite_series(s)
+            if m < 2:
+                return False
+            # need enough cycles to be confident
+            if len(x) < max(3 * m, 40):
+                return False
+
+            # compute lag-m correlation
+            a = x.values[m:]
+            b = x.values[:-m]
+            a = a - np.mean(a)
+            b = b - np.mean(b)
+            denom = (np.std(a) * np.std(b))
+            if denom <= 0:
+                return False
+            corr_m = float(np.dot(a, b) / (len(a) * denom))
+
+            # conservative threshold: require a noticeable seasonal signal
+            return corr_m >= 0.30
+
+        def _needs_nonseasonal_diff(s: pd.Series) -> bool:
+            """
+            Gate for non-seasonal differencing.
+            Methodology: apply d when evidence of unit-root / high persistence exists.
+
+            Priority:
+              - If stationarity tests available: use them (ADF high p or KPSS low p => diff needed)
+              - Otherwise: lag-1 autocorr heuristic (very high persistence)
+            """
+            x = _finite_series(s)
+            if len(x) < 10:
+                return False
+
+            # If stationarity tests are enabled and available, use them
+            if self.enable_stationarity_tests and (adfuller is not None) and (kpss is not None) and (
+                    len(x) >= self.min_obs_for_tests):
+                try:
+                    adf_p = self._adf_pvalue(x)
+                except Exception:
+                    adf_p = None
+                try:
+                    kpss_p = self._kpss_pvalue(x)
+                except Exception:
+                    kpss_p = None
+
+                # If either test indicates non-stationarity, we allow differencing
+                if adf_p is not None and adf_p >= self.adf_alpha:
+                    return True
+                if kpss_p is not None and kpss_p <= self.kpss_alpha:
+                    return True
+
+                # ambiguous -> allow differencing if strongly persistent
+                # (fall through to lag1 heuristic)
+
+            # Lag-1 autocorr heuristic fallback
+            if len(x) < 3:
+                return False
+            v = x.values
+            v0 = v[1:] - np.mean(v[1:])
+            v1 = v[:-1] - np.mean(v[:-1])
+            denom = np.std(v0) * np.std(v1)
+            if denom <= 0:
+                return False
+            r1 = float(np.dot(v0, v1) / (len(v0) * denom))
+            return r1 >= 0.80
+
+        def _stationarity_score(meta: SeriesVariantMeta) -> float:
+            """
+            Lower is better. Used only for "did this step help?" decisions.
+            If tests missing/ambiguous, return inf (no evidence of improvement).
+            """
+            if meta.adf_pvalue is None or meta.kpss_pvalue is None:
+                return float("inf")
+            # ADF: want small; KPSS: want large
+            adf_term = meta.adf_pvalue / max(self.adf_alpha, 1e-12)
+            kpss_term = max(self.kpss_alpha, 1e-12) / max(meta.kpss_pvalue, 1e-12)
+            return float(adf_term + kpss_term)
+
+        # ----------------------------
+        # Register raw + checkpoint
+        # ----------------------------
         self._register_variant(
             bundle=bundle,
             name="raw",
@@ -184,115 +322,161 @@ class TimeSeriesTransformer:
             self._bundle = bundle
             return bundle
 
+        # Keep a score snapshot (if available) to measure "helped"
+        best_name = chosen
+        best_score = _stationarity_score(bundle.meta(chosen))
+
         # -----------------------------------------------------------------
-        # Step 1: Variance stabilization (log / log1p) - best-effort
+        # Step 1: Variance stabilization (evidence-gated)
         # -----------------------------------------------------------------
-        variance_candidates = [t for t in self.transforms if t != "identity"]
-
-        for tname in variance_candidates:
-            if self.max_variants is not None and len(bundle.variants) >= self.max_variants:
-                bundle.meta(chosen).warnings.append("max_variants reached; stopping further variant creation.")
-                break
-
-            if tname == "log":
-                try:
-                    y_t, op = self._apply_log(y_raw)
-                except Exception as e:
-                    bundle.meta(chosen).notes.append(f"Skipped log: {e}")
-                    continue
-
-                vname = "log"
-                ops = [SeriesOperation("identity", {}), op]
-
-            elif tname == "log1p":
-                try:
-                    y_t, op = self._apply_log1p(y_raw)
-                except Exception as e:
-                    bundle.meta(chosen).notes.append(f"Skipped log1p: {e}")
-                    continue
-
-                vname = "log1p"
-                ops = [SeriesOperation("identity", {}), op]
-
-            else:
-                # v1 ignores other transforms
-                continue
-
-            self._register_variant(
-                bundle=bundle,
-                name=vname,
-                series=y_t,
-                ops=ops,
-                lineage=f"{chosen} -> {vname}",
-            )
-
-            # Optional: attach offset note for log variants (helps diagnostics later)
-            if tname == "log":
-                offset = float(op.params.get("offset", 0.0))
-                if offset > 0:
-                    bundle.meta(vname).notes.append(f"log offset applied: {offset}")
-
-            ok = self._stationarity_checkpoint(bundle, vname)
-            if ok:
-                chosen = vname
-                bundle.meta(chosen).recommended_for.append("final_stationary")
-                self._bundle = bundle
-                return bundle
-
-        # If none achieved stationarity, pick the latest variance transform that exists
-        if bundle.has("log1p"):
-            chosen = "log1p"
-        elif bundle.has("log"):
-            chosen = "log"
+        do_var = _needs_variance_stabilization(y_raw)
+        if not do_var:
+            bundle.meta("raw").notes.append("Variance stabilization skipped: no strong evidence of growing variance.")
         else:
-            chosen = "raw"
+            variance_candidates = [t for t in self.transforms if t != "identity"]
 
-        # -----------------------------------------------------------------
-        # Step 2: Seasonal differencing (conditional on seasonal_period)
-        # -----------------------------------------------------------------
-        m = self.seasonal_period
-        if m is not None and isinstance(m, int) and m >= 2:
-            current_name = chosen
-            current_series = bundle.get(current_name)
-            current_ops = list(bundle.meta(current_name).operations)
-
-            for sd in self.seasonal_difference_orders:
-                sd = int(sd)
-                if sd <= 0:
-                    continue
-
+            for tname in variance_candidates:
                 if self.max_variants is not None and len(bundle.variants) >= self.max_variants:
-                    bundle.meta(current_name).warnings.append("max_variants reached; stopping seasonal differencing.")
+                    bundle.meta(best_name).warnings.append("max_variants reached; stopping variance stabilization.")
                     break
 
-                y_sd, sd_ops = self._apply_seasonal_diff(current_series, m=m, order=sd)
-                next_name = self._append_seasdiff_name(current_name, sd=sd, m=m)
+                if tname == "log":
+                    try:
+                        y_t, op = self._apply_log(y_raw)
+                    except Exception as e:
+                        bundle.meta(best_name).notes.append(f"Skipped log: {e}")
+                        continue
+                    vname = "log"
+                    ops = [SeriesOperation("identity", {}), op]
+
+                elif tname == "log1p":
+                    try:
+                        y_t, op = self._apply_log1p(y_raw)
+                    except Exception as e:
+                        bundle.meta(best_name).notes.append(f"Skipped log1p: {e}")
+                        continue
+                    vname = "log1p"
+                    ops = [SeriesOperation("identity", {}), op]
+
+                else:
+                    continue
 
                 self._register_variant(
                     bundle=bundle,
-                    name=next_name,
-                    series=y_sd,
-                    ops=current_ops + sd_ops,
-                    lineage=f"{current_name} -> {next_name}",
+                    name=vname,
+                    series=y_t,
+                    ops=ops,
+                    lineage=f"raw -> {vname}",
                 )
 
-                ok = self._stationarity_checkpoint(bundle, next_name)
+                if tname == "log":
+                    offset = float(op.params.get("offset", 0.0))
+                    if offset > 0:
+                        bundle.meta(vname).notes.append(f"log offset applied: {offset}")
 
-                current_name = next_name
-                current_series = y_sd
-                current_ops = list(bundle.meta(current_name).operations)
-
+                ok = self._stationarity_checkpoint(bundle, vname)
                 if ok:
-                    chosen = current_name
-                    bundle.meta(chosen).recommended_for.append("final_stationary")
+                    bundle.meta(vname).recommended_for.append("final_stationary")
                     self._bundle = bundle
                     return bundle
-        else:
-            bundle.meta(chosen).notes.append("seasonal_period not set; skipping seasonal differencing.")
+
+                # Only *carry forward* variance transform if it improves variance structure
+                # and/or improves stationarity score (when scores available).
+                helped_var = _variance_improved(y_raw, y_t)
+                cand_score = _stationarity_score(bundle.meta(vname))
+                helped_score = cand_score < best_score
+
+                if helped_var or helped_score:
+                    best_name = vname
+                    best_score = min(best_score, cand_score)
+                    bundle.meta(vname).notes.append(
+                        "Accepted as carry-forward candidate: improved variance structure and/or stationarity evidence."
+                    )
+                else:
+                    bundle.meta(vname).notes.append(
+                        "Not carried forward: variance stabilization not clearly justified/helpful."
+                    )
+
+        chosen = best_name
 
         # -----------------------------------------------------------------
-        # Step 3: Non-seasonal differencing (d)
+        # Step 2: Seasonal differencing (evidence-gated on m)
         # -----------------------------------------------------------------
+        m = self.seasonal_period
+        seasonal_applied = False
+        post_seasonal_name = chosen
+
+        if m is None or not isinstance(m, int) or m < 2:
+            bundle.meta(chosen).notes.append("Seasonal differencing skipped: seasonal_period not set/invalid.")
+        else:
+            # evidence gate: do we actually see seasonal dependence at lag m?
+            if not _seasonality_supported(bundle.get(chosen), m):
+                bundle.meta(chosen).notes.append(
+                    f"Seasonal differencing skipped: insufficient evidence of seasonality at m={m}."
+                )
+            else:
+                current_name = chosen
+                current_series = bundle.get(current_name)
+                current_ops = list(bundle.meta(current_name).operations)
+
+                for sd in self.seasonal_difference_orders:
+                    sd = int(sd)
+                    if sd <= 0:
+                        continue
+
+                    if self.max_variants is not None and len(bundle.variants) >= self.max_variants:
+                        bundle.meta(current_name).warnings.append(
+                            "max_variants reached; stopping seasonal differencing.")
+                        break
+
+                    y_sd, sd_ops = self._apply_seasonal_diff(current_series, m=m, order=sd)
+                    next_name = self._append_seasdiff_name(current_name, sd=sd, m=m)
+
+                    self._register_variant(
+                        bundle=bundle,
+                        name=next_name,
+                        series=y_sd,
+                        ops=current_ops + sd_ops,
+                        lineage=f"{current_name} -> {next_name}",
+                    )
+
+                    seasonal_applied = True
+                    post_seasonal_name = next_name
+
+                    ok = self._stationarity_checkpoint(bundle, next_name)
+                    if ok:
+                        bundle.meta(next_name).recommended_for.append("final_stationary")
+                        self._bundle = bundle
+                        return bundle
+
+                    # If not stationary, only carry forward if stationarity evidence improves
+                    cand_score = _stationarity_score(bundle.meta(next_name))
+                    if cand_score < best_score:
+                        best_score = cand_score
+                        post_seasonal_name = next_name
+                        bundle.meta(next_name).notes.append(
+                            "Seasonal diff improved stationarity evidence; carried forward.")
+                    else:
+                        bundle.meta(next_name).notes.append("Seasonal diff did not improve stationarity evidence.")
+
+                    # chain within seasonal stage (for sequential sd orders)
+                    current_name = next_name
+                    current_series = y_sd
+                    current_ops = list(bundle.meta(current_name).operations)
+
+        if seasonal_applied:
+            chosen = post_seasonal_name
+
+        # -----------------------------------------------------------------
+        # Step 3: Non-seasonal differencing (evidence-gated)
+        # -----------------------------------------------------------------
+        if not _needs_nonseasonal_diff(bundle.get(chosen)):
+            bundle.meta(chosen).notes.append(
+                "Non-seasonal differencing skipped: insufficient evidence of unit-root/persistence.")
+            bundle.meta(chosen).recommended_for.append("best_effort_final")
+            self._bundle = bundle
+            return bundle
+
         current_name = chosen
         current_series = bundle.get(current_name)
         current_ops = list(bundle.meta(current_name).operations)
@@ -318,21 +502,28 @@ class TimeSeriesTransformer:
             )
 
             ok = self._stationarity_checkpoint(bundle, next_name)
+            if ok:
+                bundle.meta(next_name).recommended_for.append("final_stationary")
+                self._bundle = bundle
+                return bundle
+
+            # carry forward if stationarity evidence improves
+            cand_score = _stationarity_score(bundle.meta(next_name))
+            if cand_score < best_score:
+                best_score = cand_score
+                chosen = next_name
+                bundle.meta(next_name).notes.append("Differencing improved stationarity evidence; carried forward.")
+            else:
+                bundle.meta(next_name).notes.append("Differencing did not improve stationarity evidence.")
 
             current_name = next_name
             current_series = y_d
             current_ops = list(bundle.meta(current_name).operations)
 
-            if ok:
-                chosen = current_name
-                bundle.meta(chosen).recommended_for.append("final_stationary")
-                self._bundle = bundle
-                return bundle
-
-        # If we got here, nothing passed stationarity (or tests unavailable/ambiguous).
-        bundle.meta(current_name).warnings.append("No variant achieved stationarity under the configured path.")
-        bundle.meta(current_name).recommended_for.append("best_effort_final")
-
+        # Nothing passed cleanly; keep best effort
+        bundle.meta(chosen).warnings.append(
+            "No variant achieved stationarity under the configured, evidence-gated path.")
+        bundle.meta(chosen).recommended_for.append("best_effort_final")
         self._bundle = bundle
         return bundle
 
