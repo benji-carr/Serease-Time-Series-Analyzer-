@@ -162,11 +162,13 @@ class TimeSeriesTransformer:
         If tests are disabled/unavailable, we still create the variants but cannot stop early.
         """
         self._validate_input(cleaned_df)
+
+        # NOTE: Keep this strict for now; coercion policy belongs upstream (cleaner).
         y_raw = cleaned_df[self.target_col].astype("float64")
 
         bundle = TransformBundle(base_name="raw")
 
-        # register raw
+        # --- register raw ---
         self._register_variant(
             bundle=bundle,
             name="raw",
@@ -182,25 +184,53 @@ class TimeSeriesTransformer:
             self._bundle = bundle
             return bundle
 
-        # Step 1: variance stabilization
+        # -----------------------------------------------------------------
+        # Step 1: Variance stabilization (log / log1p) - best-effort
+        # -----------------------------------------------------------------
         variance_candidates = [t for t in self.transforms if t != "identity"]
+
         for tname in variance_candidates:
             if self.max_variants is not None and len(bundle.variants) >= self.max_variants:
                 bundle.meta(chosen).warnings.append("max_variants reached; stopping further variant creation.")
                 break
 
             if tname == "log":
-                y_t, op = self._apply_log(y_raw)
+                try:
+                    y_t, op = self._apply_log(y_raw)
+                except Exception as e:
+                    bundle.meta(chosen).notes.append(f"Skipped log: {e}")
+                    continue
+
                 vname = "log"
                 ops = [SeriesOperation("identity", {}), op]
+
             elif tname == "log1p":
-                y_t, op = self._apply_log1p(y_raw)
+                try:
+                    y_t, op = self._apply_log1p(y_raw)
+                except Exception as e:
+                    bundle.meta(chosen).notes.append(f"Skipped log1p: {e}")
+                    continue
+
                 vname = "log1p"
                 ops = [SeriesOperation("identity", {}), op]
+
             else:
+                # v1 ignores other transforms
                 continue
 
-            self._register_variant(bundle=bundle, name=vname, series=y_t, ops=ops, lineage=f"{chosen} -> {vname}")
+            self._register_variant(
+                bundle=bundle,
+                name=vname,
+                series=y_t,
+                ops=ops,
+                lineage=f"{chosen} -> {vname}",
+            )
+
+            # Optional: attach offset note for log variants (helps diagnostics later)
+            if tname == "log":
+                offset = float(op.params.get("offset", 0.0))
+                if offset > 0:
+                    bundle.meta(vname).notes.append(f"log offset applied: {offset}")
 
             ok = self._stationarity_checkpoint(bundle, vname)
             if ok:
@@ -209,7 +239,7 @@ class TimeSeriesTransformer:
                 self._bundle = bundle
                 return bundle
 
-        # pick latest variance transform that exists
+        # If none achieved stationarity, pick the latest variance transform that exists
         if bundle.has("log1p"):
             chosen = "log1p"
         elif bundle.has("log"):
@@ -217,7 +247,9 @@ class TimeSeriesTransformer:
         else:
             chosen = "raw"
 
-        # Step 2: seasonal differencing
+        # -----------------------------------------------------------------
+        # Step 2: Seasonal differencing (conditional on seasonal_period)
+        # -----------------------------------------------------------------
         m = self.seasonal_period
         if m is not None and isinstance(m, int) and m >= 2:
             current_name = chosen
@@ -245,6 +277,7 @@ class TimeSeriesTransformer:
                 )
 
                 ok = self._stationarity_checkpoint(bundle, next_name)
+
                 current_name = next_name
                 current_series = y_sd
                 current_ops = list(bundle.meta(current_name).operations)
@@ -257,7 +290,9 @@ class TimeSeriesTransformer:
         else:
             bundle.meta(chosen).notes.append("seasonal_period not set; skipping seasonal differencing.")
 
-        # Step 3: non-seasonal differencing
+        # -----------------------------------------------------------------
+        # Step 3: Non-seasonal differencing (d)
+        # -----------------------------------------------------------------
         current_name = chosen
         current_series = bundle.get(current_name)
         current_ops = list(bundle.meta(current_name).operations)
@@ -294,6 +329,7 @@ class TimeSeriesTransformer:
                 self._bundle = bundle
                 return bundle
 
+        # If we got here, nothing passed stationarity (or tests unavailable/ambiguous).
         bundle.meta(current_name).warnings.append("No variant achieved stationarity under the configured path.")
         bundle.meta(current_name).recommended_for.append("best_effort_final")
 
