@@ -187,24 +187,28 @@ class TimeSeriesCleaner:
     # ------------------------------------------------------------------
     def _ensure_datetime_index(self) -> pd.DataFrame:
         """
-        Ensure the DataFrame is indexed by datetime and sorted.
+        Ensure df is indexed by datetime and sorted.
 
-        Supports two schema modes:
-          1) schema.date_col == "__index__"  -> the date axis is df.index
-          2) schema.date_col is a real column name -> parse that column and set as index
-
-        Returns
-        -------
-        pandas.DataFrame
-            DataFrame indexed by datetime and sorted in ascending order.
-
-        Raises
-        ------
-        ValueError
-            If parsing fails completely or no usable date axis is available.
+        Supports:
+          - schema.date_col == "__index__"  -> use df.index as the datetime axis
+          - schema.date_col is a real column name -> parse and set as index
+          - schema.date_col is None but df.index is datetime -> fallback to index (MVP safe)
         """
         date_col = self.schema.date_col
+
+        # ------------------------------------------------------------------
+        # Fallback: schema didn't detect a date column, but index is datetime
+        # ------------------------------------------------------------------
         if date_col is None:
+            if isinstance(self.df.index, pd.DatetimeIndex) or pd.api.types.is_datetime64_any_dtype(self.df.index):
+                self.notes.append("schema.date_col was None, but df.index is datetime; using index as time axis.")
+                df_ts = self.df.copy()
+                if not isinstance(df_ts.index, pd.DatetimeIndex):
+                    df_ts.index = pd.to_datetime(df_ts.index, errors="coerce")
+                if df_ts.index.isna().all():
+                    raise ValueError("df.index appears datetime-like but could not be parsed to datetime.")
+                return df_ts.sort_index()
+
             raise ValueError("No date column available in schema for TimeSeriesCleaner.")
 
         # ------------------------------------------------------------------
@@ -213,41 +217,16 @@ class TimeSeriesCleaner:
         if date_col == "__index__":
             df_ts = self.df.copy()
 
-            # If it's already a DatetimeIndex, just sort and return.
-            if isinstance(df_ts.index, pd.DatetimeIndex):
-                return df_ts.sort_index()
+            if not (isinstance(df_ts.index, pd.DatetimeIndex) or pd.api.types.is_datetime64_any_dtype(df_ts.index)):
+                df_ts.index = pd.to_datetime(df_ts.index, errors="coerce")
 
-            # Otherwise, attempt to parse the index to datetime.
-            try:
-                idx = pd.to_datetime(
-                    df_ts.index,
-                    errors="coerce",
-                    format=self.date_format if self.date_format else None,
-                )
-            except Exception as exc:
-                raise ValueError(
-                    f"Failed to parse DataFrame index as datetime. Original error: {exc}"
-                )
+            if df_ts.index.isna().all():
+                raise ValueError("Schema requested '__index__' but df.index could not be parsed as datetime.")
 
-            if pd.isna(idx).all():
-                raise ValueError(
-                    "Schema requested '__index__' but DataFrame index could not be parsed as datetime."
-                )
-
-            if pd.isna(idx).any():
-                n_bad = int(pd.isna(idx).sum())
-                self.notes.append(
-                    f"Index datetime parsing produced {n_bad} unparseable values; dropping those rows."
-                )
-
-            mask_valid = ~pd.isna(idx)
-            df_ts = df_ts.loc[mask_valid].copy()
-            df_ts.index = pd.DatetimeIndex(idx[mask_valid])
-            df_ts = df_ts.sort_index()
-            return df_ts
+            return df_ts.sort_index()
 
         # ------------------------------------------------------------------
-        # Case B: Schema provides a real date column
+        # Case B: Normal column-based date parsing
         # ------------------------------------------------------------------
         if date_col not in self.df.columns:
             raise ValueError(f"Date column '{date_col}' not found in DataFrame.")
@@ -280,20 +259,19 @@ class TimeSeriesCleaner:
             n_bad = int(dt.isna().sum())
             if self.date_format:
                 self.notes.append(
-                    f"Date column '{date_col}' has {n_bad} values that do not match "
-                    f"date_format='{self.date_format}'; dropping those rows."
+                    f"Date column '{date_col}' has {n_bad} values that do not match date_format='{self.date_format}'; "
+                    "dropping those rows."
                 )
             else:
                 self.notes.append(
-                    f"Date column '{date_col}' contains {n_bad} unparseable values; these rows will be dropped."
+                    f"Date column '{date_col}' contains {n_bad} unparseable values; dropping those rows."
                 )
 
         mask_valid = ~dt.isna()
         df_ts = self.df.loc[mask_valid].copy()
         df_ts[date_col] = dt[mask_valid]
 
-        df_ts = df_ts.set_index(date_col)
-        df_ts = df_ts.sort_index()
+        df_ts = df_ts.set_index(date_col).sort_index()
         return df_ts
 
     def _handle_duplicates(self, df_ts: pd.DataFrame) -> Tuple[pd.DataFrame, bool]:
@@ -419,55 +397,37 @@ class TimeSeriesCleaner:
             freq: Optional[str],
     ) -> Tuple[pd.DataFrame, bool, int]:
         """
-        Detect missing timestamps relative to `freq`.
+        Detect missing timestamps and optionally reindex.
 
-        Behavior
-        --------
-        - If freq is None (or empty index), we cannot define "missing dates" -> return (df_ts, False, 0).
-        - If missing_policy == "keep": DO NOT reindex; only compute and report missingness.
-        - If missing_policy == "reindex": reindex to a complete grid (introducing NaNs).
+        missing_policy:
+          - "keep": do not reindex; only compute/return missing stats
+          - "reindex": reindex to full grid (introduce NaNs)
         """
         index = df_ts.index
 
         if freq is None or len(index) == 0:
             return df_ts, False, 0
 
-        # Build the full expected index at the given frequency
         full_index = pd.date_range(start=index[0], end=index[-1], freq=freq)
-
-        # Compare original index to the full grid
         missing = full_index.difference(index)
         n_missing = int(len(missing))
         has_missing = n_missing > 0
 
-        # Notes (informational either way)
         if has_missing:
             self.notes.append(
-                f"Detected {n_missing} missing timestamps between {index[0]} and {index[-1]} "
-                f"at frequency '{freq}'."
+                f"Detected {n_missing} missing timestamps between {index[0]} and {index[-1]} at frequency '{freq}'."
             )
         else:
             self.notes.append(
-                f"No missing timestamps detected between {index[0]} and {index[-1]} "
-                f"at frequency '{freq}'."
+                f"No missing timestamps detected between {index[0]} and {index[-1]} at frequency '{freq}'."
             )
 
-        # Policy gate
         if self.missing_policy == "keep":
-            if has_missing:
-                self.notes.append("missing_policy='keep': leaving index irregular; not reindexing.")
             return df_ts, has_missing, n_missing
 
-        # missing_policy == "reindex" (default behavior)
-        if has_missing:
-            self.notes.append(
-                f"missing_policy='reindex': reindexing to a full {freq} grid; "
-                "NaN values mark originally missing observations."
-            )
-        else:
-            self.notes.append(f"missing_policy='reindex': index already complete; reindexing is a no-op.")
-
+        # missing_policy == "reindex"
         df_ts = df_ts.reindex(full_index)
+        self.notes.append(f"Reindexed to full '{freq}' grid; NaNs mark originally missing observations.")
         return df_ts, has_missing, n_missing
 
     def _build_meta(
