@@ -59,6 +59,7 @@ class IngestionMetadata:
     encoding: Optional[str]
     delimiter: Optional[str]
     warnings: List[str]
+    index_is_datetime: bool
 
 
 class DataIngestor:
@@ -147,6 +148,7 @@ class DataIngestor:
             encoding=self.encoding,
             delimiter=getattr(self, 'delimiter', None),
             warnings=self.warnings.copy(),
+            index_is_datetime=index_is_datetime,
         )
 
     def validate(self) -> List[str]:
@@ -506,4 +508,10 @@ class DataIngestor:
             self.warnings.append(
                 "No numeric or datetime-like columns detected; "
                 "this may not be suitable for time series modeling."
+            )
+        # DatetimeIndex check (important for time-series pipelines)
+        if isinstance(self.df.index, pd.DatetimeIndex):
+            self.warnings.append(
+                "DataFrame index is a DatetimeIndex; downstream schema detection "
+                "may treat the index as the primary date axis."
             )

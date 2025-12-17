@@ -238,6 +238,28 @@ class SchemaDetector:
                         )
 
         # ------------------------------------------------------------------
+        # 1b. DatetimeIndex override (strong signal)
+        # ------------------------------------------------------------------
+        # If ingestion already indicates a DatetimeIndex, prefer using it as the date axis.
+        # We return a sentinel string so downstream schema logic can treat "date_col"
+        # as coming from the index rather than a column.
+        ingestion_meta = getattr(self, "ingestion_meta", None)
+        index_is_datetime = False
+
+        if ingestion_meta is not None and getattr(ingestion_meta, "index_is_datetime", False):
+            index_is_datetime = True
+        elif isinstance(df.index, pd.DatetimeIndex):
+            index_is_datetime = True
+
+        if index_is_datetime:
+            self.notes.append(
+                "Using DatetimeIndex as date axis (ingestion_meta.index_is_datetime=True)."
+                if ingestion_meta is not None and getattr(ingestion_meta, "index_is_datetime", False)
+                else "Using DatetimeIndex as date axis (df.index is DatetimeIndex)."
+            )
+            return "__index__"
+
+        # ------------------------------------------------------------------
         # 2. Native datetime64 columns (already parsed)
         #    If multiple, choose by name_score (favor 'date' over 'date_start').
         # ------------------------------------------------------------------
