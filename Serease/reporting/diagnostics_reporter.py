@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Sequence
+
+import html
+import pathlib
 
 import pandas as pd
-from IPython.display import HTML, display
 
+from Serease.diagnostics.report_types import DiagnosticsReport, StepResult
 from .plot_utils import (
-    PlotTheme,
-    apply_theme,
     fig_to_base64,
-    lineplot_series,
-    multi_lineplot,
-    histogram_kde,
     periodogram_plot,
     stationarity_scatter_plot,
     acf_plot_from_payload,
@@ -23,247 +21,348 @@ from .plot_utils import (
 
 @dataclass
 class ReporterConfig:
-    theme: PlotTheme = field(default_factory=PlotTheme)
-    dpi: int = 150
-    max_table_rows: int = 40
+    """
+    Controls which optional sections/tables are rendered.
+
+    MVP defaults keep the report readable and avoid giant tables.
+    """
     show_period_table: bool = False
     show_acf_pacf_table: bool = False
     show_stationarity_tables: bool = False
 
+    max_table_rows: int = 50
+
 
 class DiagnosticsReporter:
+    """
+    Renders a DiagnosticsReport into notebook-viewable HTML (and exportable HTML file).
+
+    Contract:
+      - Reporter never computes diagnostics; it only renders StepResults and Artifacts.
+      - Reporter must tolerate missing steps/artifacts (render placeholders, not crashes).
+    """
+
     def __init__(
         self,
-        diagnostics_report: Any,
-        transform_bundle: Any,
+        report: DiagnosticsReport,
+        transform_bundle: Optional[Any] = None,
         cleaned_df: Optional[pd.DataFrame] = None,
         schema_meta: Optional[Any] = None,
         ts_meta: Optional[Any] = None,
         config: Optional[ReporterConfig] = None,
-        title: str = "Serease Diagnostics Report",
     ) -> None:
-        self.report = diagnostics_report
-        self.bundle = transform_bundle
+        """
+        Construct a reporter.
+
+        Parameters
+        ----------
+        report:
+            DiagnosticsReport produced by DiagnosticsEngine.
+        transform_bundle:
+            Optional transform bundle (not required for basic rendering).
+        cleaned_df, schema_meta, ts_meta:
+            Optional context; reporter should not depend on these to render core sections.
+        config:
+            ReporterConfig controlling table visibility and truncation.
+        """
+        self.report = report
+        self.transform_bundle = transform_bundle
         self.cleaned_df = cleaned_df
-        self.schema = schema_meta
+        self.schema_meta = schema_meta
         self.ts_meta = ts_meta
         self.config = config or ReporterConfig()
-        self.title = title
-
-        apply_theme(self.config.theme)
-
-    def to_html(self, path: str) -> str:
-        html = self._build_html()
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(html)
-        return path
 
     def show_in_notebook(self) -> None:
-        html = self._build_html()
-        display(HTML(html))
+        """
+        Display the report HTML in a Jupyter notebook cell.
 
-    def _build_html(self) -> str:
-        sections: List[str] = []
-        sections.append(self._html_header())
-        sections.append(self._section_overview())
-        sections.append(self._section_seasonality())
-        sections.append(self._section_stationarity())
-        sections.append(self._section_acf_pacf())
-        sections.append(self._section_stl())
-        sections.append(self._html_footer())
-        return "\n".join(sections)
+        This method requires IPython.display, but it is only imported inside the function
+        to keep the module import-safe in non-notebook environments.
+        """
+        from IPython.display import HTML, display  # type: ignore
 
-    def _get_step(self, step: str) -> Optional[Any]:
-        if self.report is None:
-            return None
-        if hasattr(self.report, "get"):
-            try:
-                return self.report.get(step)
-            except Exception:
-                return None
-        if hasattr(self.report, "results") and isinstance(self.report.results, dict):
-            return self.report.results.get(step)
-        return None
+        display(HTML(self.to_html_string()))
 
-    def _artifact_payload(self, step: str, artifact_name: str) -> Optional[Any]:
-        r = self._get_step(step)
-        if r is None:
-            return None
-        arts = getattr(r, "artifacts", None)
-        if not arts:
-            return None
-        for a in arts:
-            if getattr(a, "name", None) == artifact_name:
-                return getattr(a, "payload", None)
-        return None
+    def to_html(self, path: str) -> str:
+        """
+        Write the HTML report to disk and return the resolved path.
 
-    def _summary(self, step: str) -> Dict[str, Any]:
-        r = self._get_step(step)
-        if r is None:
-            return {}
-        return getattr(r, "summary", {}) or {}
+        Parameters
+        ----------
+        path:
+            Output file path. Parent directories must exist (MVP) or you can create them.
+        """
+        p = pathlib.Path(path)
+        html_text = self.to_html_string()
+        p.write_text(html_text, encoding="utf-8")
+        return str(p.resolve())
 
-    def _table_html(self, obj: Any, max_rows: Optional[int] = None) -> str:
-        if obj is None:
-            return "<div class='small'>No table available.</div>"
+    def to_html_string(self) -> str:
+        """
+        Return the full HTML document as a string.
 
-        mr = self.config.max_table_rows if max_rows is None else int(max_rows)
+        Contract:
+          - Always renders all stable step sections in a fixed order.
+          - Must not crash if steps or artifacts are missing.
+        """
+        parts: list[str] = []
+        parts.append(self._render_header())
 
-        if isinstance(obj, pd.Series):
-            df = obj.to_frame("value")
-        elif isinstance(obj, pd.DataFrame):
-            df = obj
-        else:
-            return "<div class='small'>Unsupported table payload.</div>"
+        for step_name in [
+            "overview",
+            "missingness",
+            "seasonality_assessment",
+            "variant_selection",
+            "stationarity_sweep",
+            "acf_pacf",
+            "stl",
+            "exog",
+        ]:
+            parts.append(self._render_step(step_name))
 
-        if len(df) > mr:
-            df_show = df.head(mr).copy()
-            extra = f"<div class='small'>Showing first {mr} rows of {len(df)}.</div>"
-        else:
-            df_show = df
-            extra = ""
+        return self._wrap_html("\n".join(parts))
 
-        return extra + df_show.to_html(index=True, escape=False)
+    # ------------------------------------------------------------------
+    # Rendering helpers
+    # ------------------------------------------------------------------
+    def _render_header(self) -> str:
+        """
+        Render the report title and lightweight metadata.
 
-    def _img_html(self, fig_b64: str, caption: str = "") -> str:
-        cap = f"<div class='small'>{caption}</div>" if caption else ""
-        return f"<div class='card'><img src='data:image/png;base64,{fig_b64}'/>{cap}</div>"
+        Notes:
+          - Keep this extremely stable; it shows even when everything else is empty.
+        """
+        title = html.escape(f"Serease Diagnostics Report — {self.report.dataset_name}")
 
-    def _meta_line(self) -> str:
-        bits = []
-        if self.schema is not None:
-            bits.append(f"<span class='pill'>target: {getattr(self.schema, 'target_col', None)}</span>")
-            bits.append(f"<span class='pill'>date: {getattr(self.schema, 'date_col', None)}</span>")
-        if self.ts_meta is not None:
-            bits.append(f"<span class='pill'>freq: {getattr(self.ts_meta, 'freq', None)}</span>")
-            bits.append(f"<span class='pill'>n_obs: {getattr(self.ts_meta, 'n_obs', None)}</span>")
-        return " ".join(bits)
+        meta_items: list[str] = []
+        for k, v in (self.report.meta or {}).items():
+            meta_items.append(
+                f"<li><b>{html.escape(str(k))}</b>: {html.escape(str(v))}</li>"
+            )
+        meta_html = "<ul>" + "\n".join(meta_items) + "</ul>" if meta_items else "<p><i>(no meta)</i></p>"
 
-    def _html_header(self) -> str:
-        return f"""
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{self.title}</title>
-<style>
-  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 24px; }}
-  h1 {{ margin-bottom: 6px; }}
-  h2 {{ margin-top: 28px; border-bottom: 1px solid #e5e5e5; padding-bottom: 6px; }}
-  .meta {{ color: #444; margin-bottom: 16px; }}
-  .grid {{ display: grid; grid-template-columns: 1fr; gap: 16px; }}
-  .card {{ border: 1px solid #e6e6e6; border-radius: 10px; padding: 14px; background: #fff; }}
-  .small {{ font-size: 13px; color: #444; }}
-  .pill {{ display: inline-block; padding: 2px 10px; border-radius: 999px; background: #f3f4f6; font-size: 12px; margin-right: 6px; }}
-  img {{ max-width: 100%; height: auto; border-radius: 8px; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ border: 1px solid #e6e6e6; padding: 8px; text-align: left; font-size: 13px; }}
-  th {{ background: #fafafa; }}
-</style>
-</head>
-<body>
-<h1>{self.title}</h1>
-<div class="meta">{self._meta_line()}</div>
-"""
+        return f"<h1>{title}</h1>\n{meta_html}\n<hr/>"
 
-    def _html_footer(self) -> str:
-        return """
-</body>
-</html>
-"""
+    def _render_step(self, step_name: str) -> str:
+        """
+        Render one step section.
 
-    def _section_overview(self) -> str:
-        ov = self._summary("overview")
-        y = None
-        if self.cleaned_df is not None and self.schema is not None:
-            tc = getattr(self.schema, "target_col", None)
-            if tc in self.cleaned_df.columns:
-                y = self.cleaned_df[tc]
+        Contract:
+          - Must render a section header even if the step is missing.
+          - Must not crash on missing artifacts or unexpected payload shapes.
+        """
+        step = self.report.get(step_name)
+        if step is None:
+            return f"<h2>{html.escape(step_name)}</h2><p><i>(step not present)</i></p><hr/>"
 
-        parts: List[str] = []
-        parts.append("<h2>Overview</h2>")
-        parts.append("<div class='grid'>")
+        parts: list[str] = [f"<h2>{html.escape(step.step_name)}</h2>"]
+        parts.append(self._render_summary(step))
+        parts.append(self._render_notes(step))
+        parts.append(self._render_warnings(step))
+        parts.append(self._render_artifacts(step))
+        parts.append("<hr/>")
+        return "\n".join([p for p in parts if p])
 
-        if y is not None:
-            fig = lineplot_series(y, title="Target series (raw)", xlabel="time", ylabel="value")
-            b64 = fig_to_base64(fig, dpi=self.config.dpi)
-            parts.append(self._img_html(b64, "Raw target series"))
-        else:
-            parts.append("<div class='card'><div class='small'>No target series available.</div></div>")
+    def _render_summary(self, step: StepResult) -> str:
+        """
+        Render the summary dict as key/value list.
 
-        parts.append("<div class='card'>")
-        parts.append("<div><b>Summary</b></div>")
-        parts.append(self._table_html(pd.Series(ov)))
-        parts.append("</div>")
+        Goal:
+          - Interpretability: keep this compact and human-readable.
+        """
+        if not step.summary:
+            return "<p><i>(no summary)</i></p>"
 
-        parts.append("</div>")
-        return "\n".join(parts)
+        items = []
+        for k, v in step.summary.items():
+            items.append(f"<li><b>{html.escape(str(k))}</b>: {html.escape(str(v))}</li>")
+        return "<ul>" + "\n".join(items) + "</ul>"
 
-    def _section_seasonality(self) -> str:
-        cand = self._artifact_payload("seasonality_assessment", "period_candidates")
-        parts: List[str] = []
-        parts.append("<h2>Seasonality</h2>")
-        parts.append("<div class='grid'>")
+    def _render_notes(self, step: StepResult) -> str:
+        """
+        Render notes (non-fatal explanations) as a collapsible section.
+        """
+        if not step.notes:
+            return ""
+        items = "\n".join(f"<li>{html.escape(str(n))}</li>" for n in step.notes)
+        return f"<details open><summary><b>Notes</b></summary><ul>{items}</ul></details>"
 
-        fig = periodogram_plot(cand, title="Periodogram candidates")
-        b64 = fig_to_base64(fig, dpi=self.config.dpi)
-        parts.append(self._img_html(b64, "Seasonality candidates"))
+    def _render_warnings(self, step: StepResult) -> str:
+        """
+        Render warnings (important but non-fatal) as a collapsible section.
+        """
+        if not step.warnings:
+            return ""
+        items = "\n".join(f"<li>{html.escape(str(w))}</li>" for w in step.warnings)
+        return f"<details open><summary><b>Warnings</b></summary><ul>{items}</ul></details>"
 
-        if self.config.show_period_table and isinstance(cand, (pd.DataFrame, pd.Series)):
-            parts.append("<div class='card'>")
-            parts.append("<div><b>Period candidates table</b></div>")
-            parts.append(self._table_html(cand))
-            parts.append("</div>")
+    def _render_artifacts(self, step: StepResult) -> str:
+        """
+        Render artifacts for a step.
 
-        parts.append("</div>")
-        return "\n".join(parts)
+        Contract:
+          - If artifacts missing, render a placeholder.
+          - If payload unexpected, render a safe fallback line.
+        """
+        if not step.artifacts:
+            return "<p><i>(no artifacts)</i></p>"
 
-    def _section_stationarity(self) -> str:
-        st = self._artifact_payload("stationarity_sweep", "stationarity_table")
-        parts: List[str] = []
-        parts.append("<h2>Stationarity</h2>")
-        parts.append("<div class='grid'>")
+        out: list[str] = []
+        for a in step.artifacts:
+            out.append(f"<h3>Artifact: {html.escape(a.name)}</h3>")
+            out.append(self._render_artifact_payload(step.step_name, a.name, a.payload))
+        return "\n".join(out)
 
-        fig = stationarity_scatter_plot(st, title="Stationarity diagnostics")
-        b64 = fig_to_base64(fig, dpi=self.config.dpi)
-        parts.append(self._img_html(b64, "Stationarity summary plot"))
+    def _render_artifact_payload(self, step_name: str, artifact_name: str, payload: Any) -> str:
+        """
+        Render known artifacts with stable visualizations.
 
-        if self.config.show_stationarity_tables and isinstance(st, (pd.DataFrame, pd.Series)):
-            parts.append("<div class='card'>")
-            parts.append("<div><b>Stationarity sweep table</b></div>")
-            parts.append(self._table_html(st))
-            parts.append("</div>")
+        Objectives:
+          1) ACF and PACF are stem plots and rendered separately (plot_utils handles stem).
+          2) Stationarity reporting is interpretable:
+             - scatter plot (ADF vs KPSS) + optional table
+             - table is truncated and readable
+        """
+        # ------------------------
+        # missingness
+        # ------------------------
+        if step_name == "missingness" and artifact_name == "missing_blocks":
+            return self._render_table(payload, title="Missing blocks")
 
-        parts.append("</div>")
-        return "\n".join(parts)
+        # ------------------------
+        # seasonality assessment
+        # ------------------------
+        if step_name == "seasonality_assessment" and artifact_name == "period_candidates":
+            fig = periodogram_plot(payload or [])
+            fig_html = self._img(fig)
+            tbl_html = self._render_table(payload, title="Period candidates") if self.config.show_period_table else ""
+            return fig_html + tbl_html
 
-    def _section_acf_pacf(self) -> str:
-        payload = self._artifact_payload("acf_pacf", "acf_pacf_payload")
-        parts: List[str] = []
-        parts.append("<h2>ACF and PACF</h2>")
-        parts.append("<div class='grid'>")
+        # ------------------------
+        # stationarity sweep
+        # ------------------------
+        if step_name == "stationarity_sweep" and artifact_name == "stationarity_table":
+            rows = payload or []
+            fig = stationarity_scatter_plot(rows)
+            fig_html = self._img(fig)
 
-        fig1 = acf_plot_from_payload(payload, title="ACF")
-        b64_1 = fig_to_base64(fig1, dpi=self.config.dpi)
-        parts.append(self._img_html(b64_1, "ACF plot"))
+            # Optional table for interpretability (often too large by default)
+            tbl_html = self._render_table(rows, title="Stationarity sweep") if self.config.show_stationarity_tables else ""
 
-        fig2 = pacf_plot_from_payload(payload, title="PACF")
-        b64_2 = fig_to_base64(fig2, dpi=self.config.dpi)
-        parts.append(self._img_html(b64_2, "PACF plot"))
+            # Small hint about interpretation
+            hint = (
+                "<p><i>Interpretation: prefer variants with low ADF p-values and high KPSS p-values. "
+                "Disagreement is labeled ambiguous.</i></p>"
+            )
+            return hint + fig_html + tbl_html
 
-        parts.append("</div>")
-        return "\n".join(parts)
+        # ------------------------
+        # ACF / PACF
+        # ------------------------
+        if step_name == "acf_pacf" and artifact_name == "acf_pacf_payload":
+            p = payload or {}
+            fig_acf = acf_plot_from_payload(p, title="ACF (stem)")
+            fig_pacf = pacf_plot_from_payload(p, title="PACF (stem)")
+            imgs = self._img(fig_acf) + self._img(fig_pacf)
 
-    def _section_stl(self) -> str:
-        stl = self._artifact_payload("stl", "stl_components")
-        parts: List[str] = []
-        parts.append("<h2>STL decomposition</h2>")
-        parts.append("<div class='grid'>")
+            tbl_html = self._render_table([p], title="ACF/PACF payload") if self.config.show_acf_pacf_table else ""
+            return imgs + tbl_html
 
-        fig = stl_components_plot(stl, title="STL components")
-        b64 = fig_to_base64(fig, dpi=self.config.dpi)
-        parts.append(self._img_html(b64, "STL decomposition"))
+        # ------------------------
+        # STL
+        # ------------------------
+        if step_name == "stl" and artifact_name == "stl_components":
+            fig = stl_components_plot(payload or {})
+            return self._img(fig)
 
-        parts.append("</div>")
-        return "\n".join(parts)
+        # ------------------------
+        # Variant selection
+        # ------------------------
+        if step_name == "variant_selection" and artifact_name == "selection_ranked":
+            return self._render_table(payload, title="Variant ranking")
+
+        # Fallback: show payload type only (prevents crashes)
+        return f"<p><i>(unrendered payload type: {html.escape(type(payload).__name__)})</i></p>"
+
+    def _render_table(self, rows: Any, title: str = "Table") -> str:
+        """
+        Render a list-of-dicts as an HTML table.
+
+        Interpretability goals:
+          - Truncate to config.max_table_rows
+          - Stable column ordering
+          - Horizontal scroll for wide tables
+        """
+        if not isinstance(rows, list) or len(rows) == 0:
+            return f"<p><i>({html.escape(title)} not available)</i></p>"
+
+        rows = rows[: self.config.max_table_rows]
+
+        # Build a stable column list from union of keys, preserving first-seen order.
+        cols: list[str] = []
+        for r in rows:
+            if isinstance(r, dict):
+                for k in r.keys():
+                    if k not in cols:
+                        cols.append(str(k))
+
+        if not cols:
+            return f"<p><i>({html.escape(title)} has no columns)</i></p>"
+
+        header = "".join(f"<th>{html.escape(c)}</th>" for c in cols)
+
+        body_rows: list[str] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            tds = "".join(f"<td>{html.escape(str(r.get(c, '')))}</td>" for c in cols)
+            body_rows.append(f"<tr>{tds}</tr>")
+
+        return (
+            f"<h4>{html.escape(title)}</h4>"
+            f"<div style='overflow-x:auto; max-width: 100%;'>"
+            f"<table class='sr-table'>"
+            f"<thead><tr>{header}</tr></thead>"
+            f"<tbody>{''.join(body_rows)}</tbody>"
+            f"</table></div>"
+        )
+
+    def _img(self, fig) -> str:
+        """
+        Convert a matplotlib figure to an embeddable <img> tag.
+        """
+        b64 = fig_to_base64(fig)
+        return f"<img src='data:image/png;base64,{b64}' style='max-width:100%; height:auto;'/>"
+
+    def _wrap_html(self, body: str) -> str:
+        """
+        Wrap body HTML into a minimal standalone HTML document with lightweight CSS.
+
+        CSS focuses on:
+          - readable tables
+          - non-overlapping headers
+          - predictable spacing
+        """
+        css = """
+        body { font-family: Arial, sans-serif; line-height: 1.35; padding: 12px; }
+        h1 { margin: 0 0 8px 0; }
+        h2 { margin: 18px 0 6px 0; }
+        h3 { margin: 12px 0 6px 0; }
+        h4 { margin: 8px 0 6px 0; }
+        hr { margin: 18px 0; }
+
+        details { margin: 8px 0; }
+
+        .sr-table { border-collapse: collapse; width: 100%; }
+        .sr-table th, .sr-table td { border: 1px solid #ccc; padding: 6px 8px; font-size: 12px; }
+        .sr-table th { background: #eee; white-space: nowrap; }
+        .sr-table td { vertical-align: top; }
+        """
+        return (
+            "<!DOCTYPE html>"
+            "<html><head><meta charset='utf-8'>"
+            f"<style>{css}</style>"
+            "</head><body>"
+            f"{body}"
+            "</body></html>"
+        )
