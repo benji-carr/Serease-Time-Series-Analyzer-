@@ -187,8 +187,11 @@ class TimeSeriesCleaner:
     # ------------------------------------------------------------------
     def _ensure_datetime_index(self) -> pd.DataFrame:
         """
-        Convert the detected date column to a ``DateTimeIndex`` using the
-        optional user-specified ``date_format`` if provided, then sort.
+        Ensure the DataFrame is indexed by datetime and sorted.
+
+        Supports two schema modes:
+          1) schema.date_col == "__index__"  -> the date axis is df.index
+          2) schema.date_col is a real column name -> parse that column and set as index
 
         Returns
         -------
@@ -198,22 +201,60 @@ class TimeSeriesCleaner:
         Raises
         ------
         ValueError
-            If no date column is available or if parsing fails completely.
+            If parsing fails completely or no usable date axis is available.
         """
         date_col = self.schema.date_col
         if date_col is None:
             raise ValueError("No date column available in schema for TimeSeriesCleaner.")
 
+        # ------------------------------------------------------------------
+        # Case A: Schema says "use the index"
+        # ------------------------------------------------------------------
+        if date_col == "__index__":
+            df_ts = self.df.copy()
+
+            # If it's already a DatetimeIndex, just sort and return.
+            if isinstance(df_ts.index, pd.DatetimeIndex):
+                return df_ts.sort_index()
+
+            # Otherwise, attempt to parse the index to datetime.
+            try:
+                idx = pd.to_datetime(
+                    df_ts.index,
+                    errors="coerce",
+                    format=self.date_format if self.date_format else None,
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to parse DataFrame index as datetime. Original error: {exc}"
+                )
+
+            if pd.isna(idx).all():
+                raise ValueError(
+                    "Schema requested '__index__' but DataFrame index could not be parsed as datetime."
+                )
+
+            if pd.isna(idx).any():
+                n_bad = int(pd.isna(idx).sum())
+                self.notes.append(
+                    f"Index datetime parsing produced {n_bad} unparseable values; dropping those rows."
+                )
+
+            mask_valid = ~pd.isna(idx)
+            df_ts = df_ts.loc[mask_valid].copy()
+            df_ts.index = pd.DatetimeIndex(idx[mask_valid])
+            df_ts = df_ts.sort_index()
+            return df_ts
+
+        # ------------------------------------------------------------------
+        # Case B: Schema provides a real date column
+        # ------------------------------------------------------------------
         if date_col not in self.df.columns:
             raise ValueError(f"Date column '{date_col}' not found in DataFrame.")
 
         series = self.df[date_col]
-        if pd.api.types.is_numeric_dtype(series):
-            series_for_parse = series.astype(str)
-        else:
-            series_for_parse = series
+        series_for_parse = series.astype(str) if pd.api.types.is_numeric_dtype(series) else series
 
-        # Parse to datetime (using explicit date_format if provided)
         try:
             dt = pd.to_datetime(
                 series_for_parse,
@@ -221,30 +262,22 @@ class TimeSeriesCleaner:
                 format=self.date_format if self.date_format else None,
             )
         except Exception as exc:
-            # Explicit format was provided but parsing failed hard
             if self.date_format:
                 raise ValueError(
-                    f"Failed to parse date column '{date_col}' using "
-                    f"date_format='{self.date_format}'. Original error: {exc}"
+                    f"Failed to parse date column '{date_col}' using date_format='{self.date_format}'. "
+                    f"Original error: {exc}"
                 )
-            else:
-                raise
+            raise
 
-        # Evaluate parsing success
         if dt.isna().all():
             if self.date_format:
                 raise ValueError(
-                    f"Failed to parse any values in date column '{date_col}' "
-                    f"using date_format='{self.date_format}'."
+                    f"Failed to parse any values in date column '{date_col}' using date_format='{self.date_format}'."
                 )
-            else:
-                raise ValueError(
-                    f"Failed to parse any values in date column '{date_col}' as datetime."
-                )
+            raise ValueError(f"Failed to parse any values in date column '{date_col}' as datetime.")
 
-        # Warn (via notes) about partial failures
         if dt.isna().any():
-            n_bad = dt.isna().sum()
+            n_bad = int(dt.isna().sum())
             if self.date_format:
                 self.notes.append(
                     f"Date column '{date_col}' has {n_bad} values that do not match "
@@ -252,19 +285,15 @@ class TimeSeriesCleaner:
                 )
             else:
                 self.notes.append(
-                    f"Date column '{date_col}' contains {n_bad} unparseable values; "
-                    "these rows will be dropped during cleaning."
+                    f"Date column '{date_col}' contains {n_bad} unparseable values; these rows will be dropped."
                 )
 
-        # Drop invalid rows and finalize
         mask_valid = ~dt.isna()
         df_ts = self.df.loc[mask_valid].copy()
         df_ts[date_col] = dt[mask_valid]
 
-        # Set index and sort chronologically
         df_ts = df_ts.set_index(date_col)
         df_ts = df_ts.sort_index()
-
         return df_ts
 
     def _handle_duplicates(self, df_ts: pd.DataFrame) -> Tuple[pd.DataFrame, bool]:
