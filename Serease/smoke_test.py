@@ -10,10 +10,49 @@ from Serease.diagnostics.diagnostics_engine import DiagnosticsEngine, Diagnostic
 from Serease.reporting.diagnostics_reporter import DiagnosticsReporter, ReporterConfig
 
 
-def run(csv_path: str, target_col: str, seasonal_period: int = 7, dataset_name: str = "smoke_test"):
-    ingestor = DataIngestor(csv_path)
-    df_raw = ingestor.load()
-    ing_meta = ingestor.get_metadata()
+def _make_ingestor(csv_path: str, mode: str) -> DataIngestor:
+    """
+    Create a DataIngestor in one of three modes:
+    - path: DataIngestor receives a filesystem path (original behavior)
+    - stream: DataIngestor receives a binary file stream (no temp file)
+    - bytes: DataIngestor receives raw bytes (no temp file)
+    """
+    p = Path(csv_path)
+    if mode == "path":
+        return DataIngestor(str(p))
+
+    if mode == "stream":
+        # file-like stream mode (mimics FastAPI UploadFile.file)
+        f = open(p, "rb")  # intentionally not using context manager; DataIngestor reads immediately
+        return DataIngestor(f, filename=p.name)
+
+    if mode == "bytes":
+        raw = p.read_bytes()
+        return DataIngestor(raw, filename=p.name)
+
+    raise ValueError(f"Unknown mode: {mode}")
+
+
+def run(
+    csv_path: str,
+    target_col: str,
+    seasonal_period: int = 7,
+    dataset_name: str = "smoke_test",
+    mode: str = "path",
+):
+    ingestor = _make_ingestor(csv_path, mode)
+
+    try:
+        df_raw = ingestor.load()
+        ing_meta = ingestor.get_metadata()
+    finally:
+        # If we created an open stream, close it
+        src = getattr(ingestor, "source", None)
+        if mode == "stream" and hasattr(src, "close"):
+            try:
+                src.close()
+            except Exception:
+                pass
 
     schema_detector = SchemaDetector(df=df_raw, ingestion_meta=ing_meta, user_target_col=target_col)
     schema_meta = schema_detector.detect()
@@ -47,8 +86,9 @@ def run(csv_path: str, target_col: str, seasonal_period: int = 7, dataset_name: 
         config=ReporterConfig(),
     )
 
-    # You want a render method for web/CLI usage:
-    html = reporter.render_html()  # implement if not present
+    # Web/CLI-friendly output
+    html = reporter.render_html()  # ensure this exists
+
     out_path = Path("artifacts") / f"{dataset_name}_diagnostics.html"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html, encoding="utf-8")
@@ -62,6 +102,14 @@ if __name__ == "__main__":
     ap.add_argument("--target", required=True)
     ap.add_argument("--m", type=int, default=7)
     ap.add_argument("--name", default="smoke_test")
-    args = ap.parse_args()
 
-    run(args.csv, args.target, args.m, args.name)
+    # NEW: choose how ingestion happens
+    ap.add_argument(
+        "--mode",
+        choices=["path", "stream", "bytes"],
+        default="path",
+        help="Ingestion mode. Use 'stream' to mimic web upload streams without temp files."
+    )
+
+    args = ap.parse_args()
+    run(args.csv, args.target, args.m, args.name, mode=args.mode)
