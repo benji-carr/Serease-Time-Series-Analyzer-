@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Optional
 
 import html
 import pathlib
@@ -29,32 +29,7 @@ class ReporterConfig:
     show_period_table: bool = False
     show_acf_pacf_table: bool = False
     show_stationarity_tables: bool = False
-
     max_table_rows: int = 50
-
-
-from __future__ import annotations
-
-import html
-import pathlib
-from typing import Any, Optional
-
-import pandas as pd
-
-from Serease.diagnostics.report_types import DiagnosticsReport, StepResult
-from Serease.reporting.plot_utils import (
-    fig_to_base64,
-    acf_plot_from_payload,
-    pacf_plot_from_payload,
-    stl_components_plot,
-    stationarity_scatter_plot,
-    periodogram_plot,
-)
-
-# ReporterConfig should already exist in this module in your project.
-# If it's defined elsewhere, adjust the import accordingly.
-# from Serease.reporting.diagnostics_reporter import ReporterConfig  # (avoid circular)
-# Ensure ReporterConfig is available in this file.
 
 
 class DiagnosticsReporter:
@@ -73,7 +48,7 @@ class DiagnosticsReporter:
         cleaned_df: Optional[pd.DataFrame] = None,
         schema_meta: Optional[Any] = None,
         ts_meta: Optional[Any] = None,
-        config: Optional["ReporterConfig"] = None,
+        config: Optional[ReporterConfig] = None,
     ) -> None:
         self.report = report
         self.transform_bundle = transform_bundle
@@ -87,11 +62,8 @@ class DiagnosticsReporter:
     # ------------------------------------------------------------------
     def render_html(self) -> str:
         """
-        Web/CLI-friendly renderer.
-
-        This is the method your smoke test expects.
-        We keep `to_html_string()` as the underlying implementation so you don't
-        break existing notebook usage.
+        Web/CLI-friendly renderer (alias).
+        Smoke test expects reporter.render_html().
         """
         return self.to_html_string()
 
@@ -99,11 +71,9 @@ class DiagnosticsReporter:
         """
         Display the report HTML in a Jupyter notebook cell.
 
-        This method requires IPython.display, but it is only imported inside
-        the function to keep the module import-safe in non-notebook environments.
+        Imported locally to keep module import-safe in non-notebook environments.
         """
         from IPython.display import HTML as IPyHTML, display  # type: ignore
-
         display(IPyHTML(self.to_html_string()))
 
     def to_html(self, path: str) -> str:
@@ -145,28 +115,16 @@ class DiagnosticsReporter:
     # Rendering helpers
     # ------------------------------------------------------------------
     def _render_header(self) -> str:
-        """
-        Render the report title and lightweight metadata.
-        """
         title = html.escape(f"Serease Diagnostics Report — {self.report.dataset_name}")
 
         meta_items: list[str] = []
         for k, v in (self.report.meta or {}).items():
-            meta_items.append(
-                f"<li><b>{html.escape(str(k))}</b>: {html.escape(str(v))}</li>"
-            )
-        meta_html = (
-            "<ul>" + "\n".join(meta_items) + "</ul>"
-            if meta_items
-            else "<p><i>(no meta)</i></p>"
-        )
+            meta_items.append(f"<li><b>{html.escape(str(k))}</b>: {html.escape(str(v))}</li>")
 
+        meta_html = "<ul>" + "\n".join(meta_items) + "</ul>" if meta_items else "<p><i>(no meta)</i></p>"
         return f"<h1>{title}</h1>\n{meta_html}\n<hr/>"
 
     def _render_step(self, step_name: str) -> str:
-        """
-        Render one step section.
-        """
         step = self.report.get(step_name)
         if step is None:
             return f"<h2>{html.escape(step_name)}</h2><p><i>(step not present)</i></p><hr/>"
@@ -211,9 +169,6 @@ class DiagnosticsReporter:
         return "\n".join(out)
 
     def _render_artifact_payload(self, step_name: str, artifact_name: str, payload: Any) -> str:
-        """
-        Render known artifacts with stable visualizations.
-        """
         # missingness
         if step_name == "missingness" and artifact_name == "missing_blocks":
             return self._render_table(payload, title="Missing blocks")
@@ -232,7 +187,6 @@ class DiagnosticsReporter:
             fig_html = self._img(fig)
 
             tbl_html = self._render_table(rows, title="Stationarity sweep") if self.config.show_stationarity_tables else ""
-
             hint = (
                 "<p><i>Interpretation: prefer variants with low ADF p-values and high KPSS p-values. "
                 "Disagreement is labeled ambiguous.</i></p>"
