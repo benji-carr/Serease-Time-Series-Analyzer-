@@ -33,6 +33,30 @@ class ReporterConfig:
     max_table_rows: int = 50
 
 
+from __future__ import annotations
+
+import html
+import pathlib
+from typing import Any, Optional
+
+import pandas as pd
+
+from Serease.diagnostics.report_types import DiagnosticsReport, StepResult
+from Serease.reporting.plot_utils import (
+    fig_to_base64,
+    acf_plot_from_payload,
+    pacf_plot_from_payload,
+    stl_components_plot,
+    stationarity_scatter_plot,
+    periodogram_plot,
+)
+
+# ReporterConfig should already exist in this module in your project.
+# If it's defined elsewhere, adjust the import accordingly.
+# from Serease.reporting.diagnostics_reporter import ReporterConfig  # (avoid circular)
+# Ensure ReporterConfig is available in this file.
+
+
 class DiagnosticsReporter:
     """
     Renders a DiagnosticsReport into notebook-viewable HTML (and exportable HTML file).
@@ -49,22 +73,8 @@ class DiagnosticsReporter:
         cleaned_df: Optional[pd.DataFrame] = None,
         schema_meta: Optional[Any] = None,
         ts_meta: Optional[Any] = None,
-        config: Optional[ReporterConfig] = None,
+        config: Optional["ReporterConfig"] = None,
     ) -> None:
-        """
-        Construct a reporter.
-
-        Parameters
-        ----------
-        report:
-            DiagnosticsReport produced by DiagnosticsEngine.
-        transform_bundle:
-            Optional transform bundle (not required for basic rendering).
-        cleaned_df, schema_meta, ts_meta:
-            Optional context; reporter should not depend on these to render core sections.
-        config:
-            ReporterConfig controlling table visibility and truncation.
-        """
         self.report = report
         self.transform_bundle = transform_bundle
         self.cleaned_df = cleaned_df
@@ -72,27 +82,36 @@ class DiagnosticsReporter:
         self.ts_meta = ts_meta
         self.config = config or ReporterConfig()
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def render_html(self) -> str:
+        """
+        Web/CLI-friendly renderer.
+
+        This is the method your smoke test expects.
+        We keep `to_html_string()` as the underlying implementation so you don't
+        break existing notebook usage.
+        """
+        return self.to_html_string()
+
     def show_in_notebook(self) -> None:
         """
         Display the report HTML in a Jupyter notebook cell.
 
-        This method requires IPython.display, but it is only imported inside the function
-        to keep the module import-safe in non-notebook environments.
+        This method requires IPython.display, but it is only imported inside
+        the function to keep the module import-safe in non-notebook environments.
         """
-        from IPython.display import HTML, display  # type: ignore
+        from IPython.display import HTML as IPyHTML, display  # type: ignore
 
-        display(HTML(self.to_html_string()))
+        display(IPyHTML(self.to_html_string()))
 
     def to_html(self, path: str) -> str:
         """
         Write the HTML report to disk and return the resolved path.
-
-        Parameters
-        ----------
-        path:
-            Output file path. Parent directories must exist (MVP) or you can create them.
         """
         p = pathlib.Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
         html_text = self.to_html_string()
         p.write_text(html_text, encoding="utf-8")
         return str(p.resolve())
@@ -128,9 +147,6 @@ class DiagnosticsReporter:
     def _render_header(self) -> str:
         """
         Render the report title and lightweight metadata.
-
-        Notes:
-          - Keep this extremely stable; it shows even when everything else is empty.
         """
         title = html.escape(f"Serease Diagnostics Report — {self.report.dataset_name}")
 
@@ -139,17 +155,17 @@ class DiagnosticsReporter:
             meta_items.append(
                 f"<li><b>{html.escape(str(k))}</b>: {html.escape(str(v))}</li>"
             )
-        meta_html = "<ul>" + "\n".join(meta_items) + "</ul>" if meta_items else "<p><i>(no meta)</i></p>"
+        meta_html = (
+            "<ul>" + "\n".join(meta_items) + "</ul>"
+            if meta_items
+            else "<p><i>(no meta)</i></p>"
+        )
 
         return f"<h1>{title}</h1>\n{meta_html}\n<hr/>"
 
     def _render_step(self, step_name: str) -> str:
         """
         Render one step section.
-
-        Contract:
-          - Must render a section header even if the step is missing.
-          - Must not crash on missing artifacts or unexpected payload shapes.
         """
         step = self.report.get(step_name)
         if step is None:
@@ -164,12 +180,6 @@ class DiagnosticsReporter:
         return "\n".join([p for p in parts if p])
 
     def _render_summary(self, step: StepResult) -> str:
-        """
-        Render the summary dict as key/value list.
-
-        Goal:
-          - Interpretability: keep this compact and human-readable.
-        """
         if not step.summary:
             return "<p><i>(no summary)</i></p>"
 
@@ -179,31 +189,18 @@ class DiagnosticsReporter:
         return "<ul>" + "\n".join(items) + "</ul>"
 
     def _render_notes(self, step: StepResult) -> str:
-        """
-        Render notes (non-fatal explanations) as a collapsible section.
-        """
         if not step.notes:
             return ""
         items = "\n".join(f"<li>{html.escape(str(n))}</li>" for n in step.notes)
         return f"<details open><summary><b>Notes</b></summary><ul>{items}</ul></details>"
 
     def _render_warnings(self, step: StepResult) -> str:
-        """
-        Render warnings (important but non-fatal) as a collapsible section.
-        """
         if not step.warnings:
             return ""
         items = "\n".join(f"<li>{html.escape(str(w))}</li>" for w in step.warnings)
         return f"<details open><summary><b>Warnings</b></summary><ul>{items}</ul></details>"
 
     def _render_artifacts(self, step: StepResult) -> str:
-        """
-        Render artifacts for a step.
-
-        Contract:
-          - If artifacts missing, render a placeholder.
-          - If payload unexpected, render a safe fallback line.
-        """
         if not step.artifacts:
             return "<p><i>(no artifacts)</i></p>"
 
@@ -216,49 +213,33 @@ class DiagnosticsReporter:
     def _render_artifact_payload(self, step_name: str, artifact_name: str, payload: Any) -> str:
         """
         Render known artifacts with stable visualizations.
-
-        Objectives:
-          1) ACF and PACF are stem plots and rendered separately (plot_utils handles stem).
-          2) Stationarity reporting is interpretable:
-             - scatter plot (ADF vs KPSS) + optional table
-             - table is truncated and readable
         """
-        # ------------------------
         # missingness
-        # ------------------------
         if step_name == "missingness" and artifact_name == "missing_blocks":
             return self._render_table(payload, title="Missing blocks")
 
-        # ------------------------
         # seasonality assessment
-        # ------------------------
         if step_name == "seasonality_assessment" and artifact_name == "period_candidates":
             fig = periodogram_plot(payload or [])
             fig_html = self._img(fig)
             tbl_html = self._render_table(payload, title="Period candidates") if self.config.show_period_table else ""
             return fig_html + tbl_html
 
-        # ------------------------
         # stationarity sweep
-        # ------------------------
         if step_name == "stationarity_sweep" and artifact_name == "stationarity_table":
             rows = payload or []
             fig = stationarity_scatter_plot(rows)
             fig_html = self._img(fig)
 
-            # Optional table for interpretability (often too large by default)
             tbl_html = self._render_table(rows, title="Stationarity sweep") if self.config.show_stationarity_tables else ""
 
-            # Small hint about interpretation
             hint = (
                 "<p><i>Interpretation: prefer variants with low ADF p-values and high KPSS p-values. "
                 "Disagreement is labeled ambiguous.</i></p>"
             )
             return hint + fig_html + tbl_html
 
-        # ------------------------
         # ACF / PACF
-        # ------------------------
         if step_name == "acf_pacf" and artifact_name == "acf_pacf_payload":
             p = payload or {}
             fig_acf = acf_plot_from_payload(p, title="ACF (stem)")
@@ -268,37 +249,24 @@ class DiagnosticsReporter:
             tbl_html = self._render_table([p], title="ACF/PACF payload") if self.config.show_acf_pacf_table else ""
             return imgs + tbl_html
 
-        # ------------------------
         # STL
-        # ------------------------
         if step_name == "stl" and artifact_name == "stl_components":
             fig = stl_components_plot(payload or {})
             return self._img(fig)
 
-        # ------------------------
         # Variant selection
-        # ------------------------
         if step_name == "variant_selection" and artifact_name == "selection_ranked":
             return self._render_table(payload, title="Variant ranking")
 
-        # Fallback: show payload type only (prevents crashes)
+        # Fallback
         return f"<p><i>(unrendered payload type: {html.escape(type(payload).__name__)})</i></p>"
 
     def _render_table(self, rows: Any, title: str = "Table") -> str:
-        """
-        Render a list-of-dicts as an HTML table.
-
-        Interpretability goals:
-          - Truncate to config.max_table_rows
-          - Stable column ordering
-          - Horizontal scroll for wide tables
-        """
         if not isinstance(rows, list) or len(rows) == 0:
             return f"<p><i>({html.escape(title)} not available)</i></p>"
 
         rows = rows[: self.config.max_table_rows]
 
-        # Build a stable column list from union of keys, preserving first-seen order.
         cols: list[str] = []
         for r in rows:
             if isinstance(r, dict):
@@ -328,21 +296,10 @@ class DiagnosticsReporter:
         )
 
     def _img(self, fig) -> str:
-        """
-        Convert a matplotlib figure to an embeddable <img> tag.
-        """
         b64 = fig_to_base64(fig)
         return f"<img src='data:image/png;base64,{b64}' style='max-width:100%; height:auto;'/>"
 
     def _wrap_html(self, body: str) -> str:
-        """
-        Wrap body HTML into a minimal standalone HTML document with lightweight CSS.
-
-        CSS focuses on:
-          - readable tables
-          - non-overlapping headers
-          - predictable spacing
-        """
         css = """
         body { font-family: Arial, sans-serif; line-height: 1.35; padding: 12px; }
         h1 { margin: 0 0 8px 0; }
