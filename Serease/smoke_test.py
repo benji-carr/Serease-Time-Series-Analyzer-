@@ -11,24 +11,19 @@ from Serease.reporting.diagnostics_reporter import DiagnosticsReporter, Reporter
 
 
 def _make_ingestor(csv_path: str, mode: str) -> DataIngestor:
-    """
-    Create a DataIngestor in one of three modes:
-    - path: DataIngestor receives a filesystem path (original behavior)
-    - stream: DataIngestor receives a binary file stream (no temp file)
-    - bytes: DataIngestor receives raw bytes (no temp file)
-    """
     p = Path(csv_path)
+
     if mode == "path":
-        return DataIngestor(str(p))
+        # Option 1: force CSV even if the saved upload path has no .csv extension
+        return DataIngestor(str(p), file_type="csv")
 
     if mode == "stream":
-        # file-like stream mode (mimics FastAPI UploadFile.file)
-        f = open(p, "rb")  # intentionally not using context manager; DataIngestor reads immediately
-        return DataIngestor(f, filename=p.name)
+        f = open(p, "rb")
+        return DataIngestor(f, filename=p.name, file_type="csv")
 
     if mode == "bytes":
         raw = p.read_bytes()
-        return DataIngestor(raw, filename=p.name)
+        return DataIngestor(raw, filename=p.name, file_type="csv")
 
     raise ValueError(f"Unknown mode: {mode}")
 
