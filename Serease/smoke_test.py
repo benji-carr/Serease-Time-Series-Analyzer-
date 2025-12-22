@@ -4,8 +4,8 @@ from pathlib import Path
 
 from Serease.ingestion import DataIngestor
 from Serease.schema import SchemaDetector
-from Serease.ingestion.time_series_cleaner import TimeSeriesCleaner
-from Serease.preprocessing.transformer import TimeSeriesTransformer
+from Serease.pre_processing.time_series_cleaner import TimeSeriesCleaner
+from Serease.pre_modeling.transformer import TimeSeriesTransformer
 from Serease.diagnostics.diagnostics_engine import DiagnosticsEngine, DiagnosticsConfig
 from Serease.reporting.diagnostics_reporter import DiagnosticsReporter, ReporterConfig
 
