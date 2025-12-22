@@ -60,7 +60,7 @@ class DataIngestor:
         encoding: Optional[str] = None,
         delimiter: Optional[str] = None,
         max_rows: Optional[int] = None,
-        filename: Optional[str] = None,  # NEW: used for stream sources
+        filename: Optional[str] = None,
     ) -> None:
         self.source: Union[Path, bytes, bytearray, BinaryIO]
         if isinstance(source, (str, Path)):
@@ -68,7 +68,7 @@ class DataIngestor:
         else:
             self.source = source
 
-        self.filename = filename  # NEW
+        self.filename = filename
         self.file_type = file_type
         self.encoding = encoding
         self.delimiter = delimiter
@@ -97,6 +97,10 @@ class DataIngestor:
         return df
 
     def preview(self, n: int = 5) -> pd.DataFrame:
+        """
+        FLAGGED This is incredibly small, is just a wrapper for head in pandas
+        This can probably be removed.
+        """
         if self.df is None:
             self.load()
         return self.df.head(n)
