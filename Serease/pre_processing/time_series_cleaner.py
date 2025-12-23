@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple, Literal
 import numpy as np
 import pandas as pd
 
-from Serease.schema import SchemaMetadata
+from Serease.pre_processing.schema_detector import SchemaMetadata
 
 
 @dataclass
@@ -132,7 +132,7 @@ class TimeSeriesCleaner:
         self.freq_override = freq
         self.duplicates_policy: DuplicatesPolicy = duplicates
         self.missing_policy: MissingDatesPolicy = missing
-        self.date_format = date_format  # new: used in _ensure_datetime_index
+        self.date_format = date_format
 
         self.notes: List[str] = []
 
