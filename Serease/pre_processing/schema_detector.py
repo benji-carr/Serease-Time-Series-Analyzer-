@@ -6,7 +6,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from Serease.ingestion import DataIngestor, IngestionMetadata
+from Serease.pre_processing import DataIngestor, IngestionMetadata
 
 @dataclass
 class SchemaMetadata:
