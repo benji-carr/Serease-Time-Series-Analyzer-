@@ -111,7 +111,7 @@ def _plot_stem_with_confint(
     lags = np.arange(len(vals))
 
     plt.figure()
-    markerline, stemlines, baseline = plt.stem(lags, vals, use_line_collection=True)
+    markerline, stemlines, baseline = plt.stem(lags, vals)
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
