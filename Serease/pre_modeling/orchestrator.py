@@ -15,9 +15,31 @@ class PreModelOrchestrator:
         self.xf = xf or TransformEngine()
         self.views = ViewBuilder(self.xf)
 
-    def run(self, bundle: SeriesBundle) -> PreModelState:
+    def run(
+            self,
+            bundle: SeriesBundle,
+            manual_plan: "TransformPlan | None" = None,
+            lock_m: bool = False,
+            lock_variance: bool = False,
+            lock_diffs: bool = False,
+    ) -> PreModelState:
+        """
+        Run the pre-model pipeline.
+
+        manual_plan:
+          - If provided, state.plan is initialized from this plan (copied).
+        lock_*:
+          - If True, the orchestrator will NOT overwrite that part of the plan
+            from diagnostic-driven suggestions/selection.
+        """
+        from dataclasses import replace
+
         state = PreModelState(bundle=bundle)
         registry = build_step_registry()
+
+        # Initialize from manual plan if provided (copy to avoid external mutation)
+        if manual_plan is not None:
+            state.plan = replace(manual_plan)
 
         # -------------------------
         # Step 1: RAW diagnostics
@@ -33,22 +55,25 @@ class PreModelOrchestrator:
         var_view = self.views.get_view(state, var_spec)
         state.diagnostics.variance = self.diag.variance_assessment(var_view, freq_hint=bundle.freq)
 
-        # Update plan based on variance evidence
-        suggested = state.diagnostics.variance.get("suggested_transform", "none")
-        offset = float(state.diagnostics.variance.get("recommended_offset", 0.0) or 0.0)
-        # Your stated preference: use log for interpretability if stabilization is needed.
-        if suggested in ("log", "boxcox"):
-            # your preference: log over boxcox
-            state.plan.variance_transform = "log" if suggested == "boxcox" else suggested
-            state.plan.boxcox_offset = offset
-            # optionally store lambda if you ever want to use it
-            # state.plan.boxcox_lambda = state.diagnostics.variance.get("boxcox_lambda_mle")
-            state.diagnostics.notes.append(
-                f"Variance transform set to {state.plan.variance_transform} with offset={state.plan.boxcox_offset:.6g}."
-            )
+        if not lock_variance:
+            suggested = state.diagnostics.variance.get("suggested_transform", "none")
+            offset = float(state.diagnostics.variance.get("recommended_offset", 0.0) or 0.0)
+
+            if suggested in ("log", "boxcox"):
+                # Preference: log over boxcox (interpretability)
+                state.plan.variance_transform = "log" if suggested == "boxcox" else suggested
+                state.plan.boxcox_offset = offset
+                state.diagnostics.notes.append(
+                    f"Variance transform set to {state.plan.variance_transform} with offset={state.plan.boxcox_offset:.6g}."
+                )
+            else:
+                state.plan.variance_transform = "none"
+                state.plan.boxcox_offset = 0.0
         else:
-            state.plan.variance_transform = "none"
-            state.plan.boxcox_offset = 0.0
+            state.diagnostics.notes.append(
+                f"Manual lock: variance preserved (variance_transform={state.plan.variance_transform}, "
+                f"offset={state.plan.boxcox_offset:.6g})."
+            )
 
         # -------------------------
         # Step 3: Periodogram (FOR_PERIODOGRAM view)
@@ -57,22 +82,21 @@ class PreModelOrchestrator:
         pg_view = self.views.get_view(state, pg_spec)
         state.diagnostics.period_candidates = self.diag.periodogram_candidates(pg_view)
 
-        # Update plan.m if chosen_m exists
-        chosen_m = state.diagnostics.period_candidates.get("chosen_m")
-        if chosen_m:
-            state.plan.seasonal_period_m = int(chosen_m)
-            state.diagnostics.notes.append(f"Seasonal period m set to {state.plan.seasonal_period_m}.")
+        if not lock_m:
+            chosen_m = state.diagnostics.period_candidates.get("chosen_m")
+            if chosen_m:
+                state.plan.seasonal_period_m = int(chosen_m)
+                state.diagnostics.notes.append(f"Seasonal period m set to {state.plan.seasonal_period_m}.")
+        else:
+            state.diagnostics.notes.append(
+                f"Manual lock: seasonal_period_m preserved (m={state.plan.seasonal_period_m})."
+            )
 
         # -------------------------
         # Step 4: Stationarity sweep + selection
-        #   - build candidate transforms (in canonical preference order)
-        #   - run stationarity tests (ADF/KPSS) + compute acf1 for overdiff guard (once implemented)
-        #   - select: least-differenced passing candidate + guardrails
-        #     with seasonal preference: (D=1,d=0) preferred over (D=0,d=1) on ties
         # -------------------------
         state.candidates = self.views.build_stationarity_candidates(state)
 
-        # thresholds used for the explicit pass/fail annotation
         alpha_adf = 0.05
         alpha_kpss = 0.05
 
@@ -80,12 +104,10 @@ class PreModelOrchestrator:
         for ts in state.candidates:
             row = self.diag.stationarity_tests(ts)
 
-            # Ensure these keys exist for selection indexing & reporting
             row.setdefault("D", ts.plan.D)
             row.setdefault("d", ts.plan.d)
             row.setdefault("m", ts.plan.seasonal_period_m)
 
-            # Explicit pass/fail (for reporting/debugging)
             adf_p = row.get("adf_pvalue")
             kpss_p = row.get("kpss_pvalue")
 
@@ -118,16 +140,21 @@ class PreModelOrchestrator:
 
         if best is not None:
             state.final = best
-            state.plan = best.plan
+
+            if not lock_diffs:
+                # adopt the chosen stationary candidate plan (includes D/d and carries variance + m too)
+                state.plan = best.plan
+            else:
+                state.diagnostics.notes.append(
+                    f"Manual lock: differencing preserved (D={state.plan.D}, d={state.plan.d}). "
+                    f"Selected candidate would have been (D={best.plan.D}, d={best.plan.d})."
+                )
 
             state.diagnostics.notes.append(
                 f"Selected stationary transform: variance={state.plan.variance_transform}, "
                 f"m={state.plan.seasonal_period_m}, D={state.plan.D}, d={state.plan.d}. "
                 f"passed={meta.get('passed')}, any_passed={meta.get('any_passed')}."
             )
-
-            # Store selection metadata for reporting/debugging
-            # (You can move this to its own packet field later)
             state.diagnostics.stationarity_selection = meta
         else:
             state.diagnostics.notes.append("No stationarity candidates were generated/selected.")
@@ -143,21 +170,25 @@ class PreModelOrchestrator:
             # Add seasonal lag summary using plan.m if available
             m = state.plan.seasonal_period_m
             if m is not None and payload.get("acf_confint") is not None:
-                max_lag = payload["nlags"]
-                acf = payload["acf"]
-                conf = payload["acf_confint"]
+                # DiagnosticsEngine.acf_pacf currently returns no "nlags" key.
+                # Use len(acf)-1 as max lag.
+                acf_vals = payload.get("acf") or []
+                conf = payload.get("acf_confint") or []
+                max_lag = len(acf_vals) - 1
 
                 seasonal = []
                 for k in [m, 2 * m, 3 * m]:
-                    if k <= max_lag:
+                    if 0 <= k <= max_lag and k < len(conf):
                         lo, hi = conf[k]
-                        seasonal.append({
-                            "lag": k,
-                            "acf": acf[k],
-                            "ci_low": lo,
-                            "ci_high": hi,
-                            "significant": (lo > 0) or (hi < 0),
-                        })
+                        seasonal.append(
+                            {
+                                "lag": int(k),
+                                "acf": float(acf_vals[k]),
+                                "ci_low": float(lo),
+                                "ci_high": float(hi),
+                                "significant": (lo > 0) or (hi < 0),
+                            }
+                        )
                 payload["seasonal_lag_summary"] = seasonal
 
             state.diagnostics.acf_pacf_payload = payload
