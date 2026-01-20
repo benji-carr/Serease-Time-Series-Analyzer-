@@ -70,7 +70,7 @@ def plot_period_resemblance(
       - top: seasonal prototype repeated over time
       - bottom: the actual series
 
-    This mirrors the idea of your example image (clean seasonal signal vs noisy series).
+    Mirrors your example image (clean seasonal signal vs noisy series).
     """
     y = _to_series(y).dropna()
     if use_first_n is not None:
@@ -99,11 +99,54 @@ def plot_period_resemblance(
 
 
 # ----------------------------
+# Rolling mean/variance (from raw diagnostics payload)
+# ----------------------------
+def plot_rolling_mean_var(raw_diagnostics: Dict[str, Any]) -> None:
+    """
+    Expects DiagnosticsEngine.raw_diagnostics output:
+      raw_diagnostics["rolling"] = {
+        "index": [...str...],
+        "rolling_mean": [...],
+        "rolling_var": [...],
+        "window": int,
+      }
+    """
+    roll = (raw_diagnostics or {}).get("rolling") or {}
+    idx = roll.get("index")
+    rm = roll.get("rolling_mean")
+    rv = roll.get("rolling_var")
+    window = roll.get("window", None)
+
+    if not idx or rm is None or rv is None:
+        print("Rolling mean/variance not available.")
+        return
+
+    # Use the string index directly for plotting ticks; matplotlib handles it ok for moderate lengths.
+    x = np.arange(len(idx))
+
+    plt.figure()
+    plt.plot(x, rm)
+    plt.title(f"Rolling mean (window={window})" if window is not None else "Rolling mean")
+    plt.xlabel("Time (index)")
+    plt.ylabel("Rolling mean")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure()
+    plt.plot(x, rv)
+    plt.title(f"Rolling variance (window={window})" if window is not None else "Rolling variance")
+    plt.xlabel("Time (index)")
+    plt.ylabel("Rolling variance")
+    plt.tight_layout()
+    plt.show()
+
+
+# ----------------------------
 # Stationarity summary (chosen plan)
 # ----------------------------
 def print_chosen_stationarity(state) -> None:
     """
-    Always-on compact summary for the FINAL selected (m,D,d), without requiring the full table.
+    Compact summary for FINAL selected (m,D,d), without requiring the full table.
     """
     if getattr(state, "final", None) is None:
         print("No final stationary series selected.")
@@ -154,14 +197,15 @@ def _plot_stem_with_confint(
     band_mode: str = "constant",   # "constant" (±1.96/sqrt(n)) or "per_lag" (statsmodels confint)
     n: int | None = None,
     z: float = 1.96,
-    skip_lag0: bool = False,
+    skip_lag0: bool = True,
+    ylim: float | None = None,
 ) -> None:
     """
     Stem plot with either:
-      - constant band: ± z/sqrt(n)  (what most people expect)
-      - per-lag band: confint returned by statsmodels (often widens with lag)
+      - constant band: ± z/sqrt(n)
+      - per-lag band: statsmodels confint (often widens with lag)
 
-    NOTE: older matplotlib doesn't support use_line_collection; we handle both.
+    Also centers around 0 and enforces a symmetric y-axis if ylim is provided.
     """
     vals = np.asarray(values, dtype=float)
     lags = np.arange(len(vals))
@@ -184,6 +228,10 @@ def _plot_stem_with_confint(
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
+    plt.axhline(0.0)
+
+    if ylim is not None:
+        plt.ylim(-float(ylim), float(ylim))
 
     if band_mode == "constant":
         if n is not None and n > 1:
@@ -208,20 +256,35 @@ def plot_acf_pacf_from_payload(
     skip_lag0: bool = True,
 ) -> None:
     """
-    Produces TWO separate plots:
+    Two separate plots:
       - ACF stem + band
       - PACF stem + band
 
-    Expects payload keys (from DiagnosticsEngine.acf_pacf):
+    Payload (from DiagnosticsEngine.acf_pacf):
       - n
       - acf, pacf
-      - acf_confint, pacf_confint  (optional)
+      - acf_confint, pacf_confint (optional)
     """
     acf_vals = acf_pacf_payload.get("acf")
     pacf_vals = acf_pacf_payload.get("pacf")
     acf_ci = acf_pacf_payload.get("acf_confint")
     pacf_ci = acf_pacf_payload.get("pacf_confint")
     n = acf_pacf_payload.get("n")
+
+    # Shared symmetric ylim for consistent visuals across ACF and PACF
+    lim = None
+    try:
+        a = np.asarray(acf_vals, dtype=float) if acf_vals is not None else np.array([0.0])
+        p = np.asarray(pacf_vals, dtype=float) if pacf_vals is not None else np.array([0.0])
+        if skip_lag0:
+            if len(a) > 1:
+                a = a[1:]
+            if len(p) > 1:
+                p = p[1:]
+        lim = float(np.nanmax(np.abs(np.concatenate([a, p])))) * 1.1
+        lim = max(lim, 0.2)
+    except Exception:
+        lim = None
 
     if acf_vals is not None:
         _plot_stem_with_confint(
@@ -232,6 +295,7 @@ def plot_acf_pacf_from_payload(
             band_mode=band_mode,
             n=n,
             skip_lag0=skip_lag0,
+            ylim=lim,
         )
 
     if pacf_vals is not None:
@@ -243,42 +307,34 @@ def plot_acf_pacf_from_payload(
             band_mode=band_mode,
             n=n,
             skip_lag0=skip_lag0,
+            ylim=lim,
         )
 
 
 # ----------------------------
-# STL plotting
+# STL display: statsmodels-like output (res.plot())
 # ----------------------------
-def plot_stl_components(stl_components: Dict[str, Any], title_prefix: str = "STL") -> None:
+def plot_stl_like_statsmodels(
+    y: pd.Series,
+    m: int,
+    robust: bool = True,
+    title: str = "",
+) -> None:
     """
-    Three separate plots: trend, seasonal, resid.
-    STL output currently stores lists without an index; we plot by position.
+    Produces the standard 4-panel STL output like statsmodels:
+      observed / trend / seasonal / resid
     """
-    if not stl_components or "trend" not in stl_components:
-        print("STL components not available.")
+    from statsmodels.tsa.seasonal import STL
+
+    s = _to_series(y).dropna().astype(float)
+    if len(s) < max(10, 2 * int(m)):
+        print(f"Not enough data for STL with period={m}. n={len(s)}")
         return
 
-    trend = stl_components.get("trend", [])
-    seasonal = stl_components.get("seasonal", [])
-    resid = stl_components.get("resid", [])
-
-    x = np.arange(len(trend))
-
-    plt.figure()
-    plt.plot(x, trend)
-    plt.title(f"{title_prefix}: Trend")
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure()
-    plt.plot(x, seasonal)
-    plt.title(f"{title_prefix}: Seasonal")
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure()
-    plt.plot(x, resid)
-    plt.title(f"{title_prefix}: Residual")
+    res = STL(s, period=int(m), robust=robust).fit()
+    fig = res.plot()
+    if title:
+        fig.suptitle(title)
     plt.tight_layout()
     plt.show()
 
@@ -311,12 +367,11 @@ def show_stationarity_table(rows: List[Dict[str, Any]], max_rows: int = 50) -> N
 class NotebookPreModelViewer:
     """
     Notebook viewer for your pre-modeling output.
-    Works best with PreModelState.
 
     Defaults:
       - stationarity table is opt-in
-      - ACF/PACF use constant band ±1.96/sqrt(n) (typical "significance" band)
-      - ACF/PACF skip lag 0 by default (cleaner)
+      - ACF/PACF use constant band ±1.96/sqrt(n)
+      - ACF/PACF skip lag 0 by default
     """
 
     def __init__(
@@ -324,15 +379,25 @@ class NotebookPreModelViewer:
         show_stationarity: bool = False,
         acf_band_mode: str = "constant",   # "constant" or "per_lag"
         skip_lag0: bool = True,
+        show_rolling: bool = True,
+        show_stl: bool = True,
+        show_stationarity_summary: bool = True,
     ):
         self.show_stationarity = show_stationarity
         self.acf_band_mode = acf_band_mode
         self.skip_lag0 = skip_lag0
+        self.show_rolling = show_rolling
+        self.show_stl = show_stl
+        self.show_stationarity_summary = show_stationarity_summary
 
     def render_from_state(self, state) -> None:
         # Basic time plot (raw)
         y_raw = state.bundle.y_raw
         plot_time_series(y_raw, title="Time plot (raw)")
+
+        # Rolling mean/variance (from raw diagnostics)
+        if self.show_rolling:
+            plot_rolling_mean_var(state.diagnostics.raw)
 
         # Period resemblance plots (from period_candidates)
         cand = state.diagnostics.period_candidates or {}
@@ -341,8 +406,9 @@ class NotebookPreModelViewer:
         if m_values:
             plot_period_resemblance(y_raw, m_values=m_values, max_candidates=5)
 
-        # Always show chosen ADF/KPSS summary (without forcing the whole table)
-        print_chosen_stationarity(state)
+        # Chosen ADF/KPSS summary
+        if self.show_stationarity_summary:
+            print_chosen_stationarity(state)
 
         # Stationarity table (opt-in)
         if self.show_stationarity:
@@ -355,15 +421,13 @@ class NotebookPreModelViewer:
         else:
             print("ACF/PACF payload not available (final series may not have been selected).")
 
-        # STL
-        stl = state.diagnostics.stl_components or {}
-        if stl:
-            plot_stl_components(stl, title_prefix="STL")
-        else:
-            if state.plan.seasonal_period_m is None:
-                print("STL skipped: seasonal_period_m not set.")
+        # STL (statsmodels-like)
+        if self.show_stl:
+            m = state.plan.seasonal_period_m
+            if m is not None:
+                plot_stl_like_statsmodels(y_raw, m=int(m), robust=True, title=f"STL (m={m})")
             else:
-                print("STL components not available (STL may have failed or not run).")
+                print("STL skipped: seasonal_period_m not set.")
 
     def render_from_report(self, report: Dict[str, Any], y: Optional[pd.Series] = None) -> None:
         """
@@ -375,6 +439,7 @@ class NotebookPreModelViewer:
 
         plot_time_series(y, title="Time plot (raw)")
 
+        # Rolling mean/variance not included in report contract yet; skip unless you add it.
         pc = artifacts.get("period_candidates", {})
         m_values = [c.get("m") for c in pc.get("candidates", []) if c.get("m") is not None]
         if m_values:
@@ -388,5 +453,6 @@ class NotebookPreModelViewer:
             plot_acf_pacf_from_payload(payload, band_mode=self.acf_band_mode, skip_lag0=self.skip_lag0)
 
         stl = artifacts.get("stl_components", {})
+        # If you want report-based STL display later, you'll likely want to store the observed index too.
         if stl:
-            plot_stl_components(stl, title_prefix="STL")
+            print("STL present in report, but statsmodels-style plotting requires original indexed series.")
