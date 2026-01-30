@@ -1,0 +1,49 @@
+# =====================
+# Python
+# =====================
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# =====================
+# Virtual environments
+# =====================
+.venv/
+venv/
+env/
+ENV/
+
+# =====================
+# IDEs / editors
+# =====================
+.idea/
+.vscode/
+
+# =====================
+# Jupyter
+# =====================
+.ipynb_checkpoints/
+
+# =====================
+# OS junk
+# =====================
+.DS_Store
+Thumbs.db
+
+# =====================
+# Data files (IMPORTANT)
+# =====================
+*.csv
+*.parquet
+*.feather
+data/
+
+# =====================
+# Logs
+# =====================
+*.log
