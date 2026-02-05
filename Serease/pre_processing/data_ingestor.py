@@ -204,6 +204,8 @@ class DataIngestor:
         - Treats ascii as utf-8
         - Defaults to utf-8 if inconclusive
         """
+        import chardet
+
         if self.encoding is not None:
             return self.encoding
 
